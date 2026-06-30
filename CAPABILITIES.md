@@ -1,21 +1,15 @@
 # pbs — ServiceBackend contract checklist
 
-Driven by the generic `service.*` surface (no per-plugin tools). `[ ]` =
-scaffolded stub. Modalities: **vm,lxc**.
+Pure-Rust plugin: **no bash, no compose, no provision scripts**. Driven by the
+generic `service.*` surface (no per-plugin tools). Modalities: **vm,lxc**.
 
-## ServiceBackend methods
-- [ ] `provider` / `modalities` / `default_port` (declared)
-- [ ] `deploy(modality)` — docker/podman/lxc/vm as applicable
-- [ ] `backup`
-- [ ] `restore`
-- [ ] `configure` — service-specific config
+## What this plugin implements (the only per-plugin work)
+- [ ] `provider` / `runtimes` / `default_port` / `capabilities` / `data_paths` — declarative
+- [ ] `workload_spec(runtime)` — *what* to run; `deploy_target` renders it to compose/LXC/VM
+- [ ] `configure` — service-specific config via the upstream API
 - [ ] `status` — health/diagnostics
-- [ ] connect/sync handled generically by the toolkit (endpoint registry + peer sync)
 
-## Deploy modalities
-- n/a docker
-- n/a podman
-- [ ] LXC (pct)
-- [ ] VM (qm)
-- n/a device
-- n/a host
+## Inherited generically (NO code in this plugin)
+- `deploy` — `service.deploy` → `deploy_target.launch(WorkloadSpec)`
+- `backup` / `restore` — pluggable `BackupMethod` (tar for containers/LXC, **PBS** for Proxmox guests when available)
+- `connect` / `sync` — endpoint registry + peer sync in the toolkit
