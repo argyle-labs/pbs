@@ -2,6 +2,10 @@
 name = "pbs"
 version = "0.1.0"
 edition = "2021"
+description = "Proxmox Backup Server — orca service-backend for backup datastores and jobs"
+
+[package.metadata.orca]
+category = "infra"
 
 [lib]
 name = "pbs"
