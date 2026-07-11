@@ -10,15 +10,17 @@ category = "infra"
 [lib]
 name = "pbs"
 path = "src/lib.rs"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "pbs"
+path = "src/main.rs"
 
 # pbs is a BACKEND-ONLY orca plugin: zero #[orca_tool]s. It registers a
 # ServiceBackend across the cdylib FFI seam and reaches the whole orca system
 # through plugin-toolkit alone.
 [dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
-# The ONE non-orca dep: #[export_root_module] expands to bare ::abi_stable paths.
-abi_stable = "0.11"
 
 [dev-dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
