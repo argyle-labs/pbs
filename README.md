@@ -39,6 +39,25 @@ docker run -d --name pbs -p 8007:8007 \
 
 PBS normally runs as two systemd units (`proxmox-backup` as root, `proxmox-backup-proxy` as `backup`, ordered after it). The image's entrypoint reproduces that ordering and privilege split under `tini`, and exits if either daemon dies so the container restarts as a whole rather than serving with half of PBS up.
 
+### Running on a NAS (Unraid, Synology, TrueNAS)
+
+PBS runs its proxy as `backup`, uid/gid **34** on a stock install. On a NAS whose shares are owned by a fixed account — Unraid uses `nobody:users` = **99:100** — every file PBS writes lands as a bare numeric `34`, outside the host's permission model, and tools that reason about share ownership stop working.
+
+Set `PUID`/`PGID` to the host's expected ids:
+
+```sh
+docker run -d --name pbs -p 8007:8007 \
+  -e PUID=99 -e PGID=100 \
+  --tmpfs /run/proxmox-backup:rw,nosuid,nodev,mode=0755 \
+  -v pbs-config:/etc/proxmox-backup \
+  -v /mnt/user/pbs:/mnt/datastore/primary \
+  ghcr.io/argyle-labs/pbs:4.2
+```
+
+The entrypoint remaps the `backup` account at start and re-stamps anything the old identity owned in `/etc/proxmox-backup`. It defaults to `34`/`34`, i.e. unchanged from a stock install.
+
+Note this only governs **new** writes. An existing datastore written under a different uid keeps that ownership until you `chown` it.
+
 The `--tmpfs /run/proxmox-backup` is **required**, not optional: PBS keeps its config-version cache in shared memory there and needs that path on tmpfs. Without it the server still starts and serves, but traffic control silently fails to load (`path "/run/proxmox-backup/shmem" is not on tmpfs`). The entrypoint warns when it is missing.
 
 Datastore contents are mounted in from outside and are never part of the image or the config volume.

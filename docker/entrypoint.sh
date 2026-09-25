@@ -7,6 +7,40 @@ set -euo pipefail
 
 PBS_LIBEXEC=/usr/lib/x86_64-linux-gnu/proxmox-backup
 
+# ── Identity remap (PUID/PGID) ───────────────────────────────────────────────
+# PBS runs its proxy as `backup`, uid/gid 34 on a stock install. On a NAS whose
+# shares are owned by a fixed account — Unraid is nobody:users = 99:100 — every
+# file PBS writes then lands as a bare numeric 34, outside the host permission
+# model entirely, and tools that reason about share ownership stop working.
+#
+# Remap the backup account to the host's expected ids instead. PBS only checks
+# that it is running AS the backup user, so which uid that resolves to is ours
+# to choose. Defaults to 34/34, i.e. unchanged from a stock install.
+PUID="${PUID:-34}"
+PGID="${PGID:-34}"
+
+OLD_UID="$(id -u backup)"
+OLD_GID="$(id -g backup)"
+
+if [[ "$OLD_GID" != "$PGID" ]]; then
+  groupmod -o -g "$PGID" backup
+fi
+if [[ "$OLD_UID" != "$PUID" ]]; then
+  usermod -o -u "$PUID" backup
+fi
+
+if [[ "$OLD_UID" != "$PUID" || "$OLD_GID" != "$PGID" ]]; then
+  echo "entrypoint: backup remapped ${OLD_UID}:${OLD_GID} -> ${PUID}:${PGID}" >&2
+  # Re-stamp ONLY what the old identity owned. Targeted rather than chown -R so
+  # root-owned files keep their ownership: authkey.key is root:root 0600, while
+  # authkey.pub and csrf.key are root:backup 0640 — the group moves, the owner
+  # must not.
+  if [[ -d /etc/proxmox-backup ]]; then
+    find /etc/proxmox-backup -uid "$OLD_UID" -exec chown -h "$PUID" {} + 2>/dev/null || true
+    find /etc/proxmox-backup -gid "$OLD_GID" -exec chgrp -h "$PGID" {} + 2>/dev/null || true
+  fi
+fi
+
 # PBS logs to syslog, which a container has no daemon for; it warns once
 # ("Unable to open syslog") and carries on writing to stdout, which is what
 # `docker logs` wants anyway. Harmless, but noted so it isn't mistaken for a
