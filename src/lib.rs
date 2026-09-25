@@ -7,9 +7,16 @@
 #![allow(clippy::disallowed_types)]
 
 use plugin_toolkit::service::{
-    BoxFuture, Endpoint, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
-    WorkloadSpec,
+    BoxFuture, Endpoint, Mount, Runtime, ServiceBackend, ServiceCapability, ServiceError,
+    ServiceStatus, WorkloadSpec,
 };
+
+/// Image published from `docker/Dockerfile` in this repo. Upstream ships PBS for
+/// bare metal / VM only, so we build from Proxmox's own `pbs-no-subscription`
+/// packages rather than depend on a third-party image.
+const IMAGE: &str = "ghcr.io/argyle-labs/pbs";
+/// Tracks the PBS minor series the image is built against.
+const IMAGE_TAG: &str = "4.2";
 
 /// pbs backend. Holds only the provider name; per-instance endpoint/creds
 /// come from the `Endpoint` the generic `service.*` tools hand each op.
@@ -33,7 +40,7 @@ impl ServiceBackend for PbsBackend {
     /// `workload_spec` below to a matching deploy target — this backend never
     /// drives pct/docker itself (that mechanic lives in the deploy-target domain).
     fn runtimes(&self) -> Vec<Runtime> {
-        vec![Runtime::Lxc, Runtime::Vm]
+        vec![Runtime::Docker, Runtime::Podman, Runtime::Lxc, Runtime::Vm]
     }
 
     fn capabilities(&self) -> Vec<ServiceCapability> {
@@ -55,18 +62,50 @@ impl ServiceBackend for PbsBackend {
     /// Proxmox guests when available) snapshots these. No backup/restore code
     /// here; those are inherited from ServiceBackend's defaults.
     fn data_paths(&self) -> Vec<String> {
-        vec!["/config".to_string()]
+        // PBS keeps its whole config surface — datastore.cfg, user.cfg, acl.cfg,
+        // plus `authkey.key` and `proxy.pem` — under one directory. Those keys
+        // ARE the server identity: restore them and existing clients keep their
+        // trust, lose them and every PVE host must re-verify a new fingerprint.
+        // Datastore *contents* are deliberately not listed: they are the backups
+        // themselves, mounted in from outside and never captured by this path.
+        vec!["/etc/proxmox-backup".to_string()]
     }
 
     fn workload_spec<'a>(
         &'a self,
-        _runtime: Runtime,
-        _ep: &'a Endpoint,
+        runtime: Runtime,
+        ep: &'a Endpoint,
     ) -> BoxFuture<'a, Result<WorkloadSpec, ServiceError>> {
-        // TODO: describe the pbs workload (image/template, ports, mounts,
-        // env) for the chosen runtime. The deploy target turns this into a
-        // compose service / LXC config / VM. See deploy-target::WorkloadSpec.
-        Box::pin(async move { Err(ServiceError::unimplemented("pbs.workload_spec")) })
+        Box::pin(async move {
+            match runtime {
+                Runtime::Docker | Runtime::Podman => Ok(WorkloadSpec {
+                    name: ep.name.clone(),
+                    image: Some(format!("{IMAGE}:{IMAGE_TAG}")),
+                    env: Vec::new(),
+                    mounts: vec![
+                        // Config + server identity. Named volume rather than a
+                        // host path so recreating the container is lossless.
+                        Mount {
+                            source: format!("{}-config", ep.name),
+                            target: "/etc/proxmox-backup".to_string(),
+                            read_only: false,
+                        },
+                        Mount {
+                            source: format!("{}-logs", ep.name),
+                            target: "/var/log/proxmox-backup".to_string(),
+                            read_only: false,
+                        },
+                    ],
+                    // Datastore mounts are deliberately absent: which paths hold
+                    // backups is per-install, so they are supplied as endpoint
+                    // config and merged by the deploy target, not hardcoded here.
+                    ports: vec![format!("{}:8007", ep.publish_port(8007))],
+                }),
+                Runtime::Lxc | Runtime::Vm => {
+                    Err(ServiceError::unimplemented("pbs.workload_spec (lxc/vm)"))
+                }
+            }
+        })
     }
 
     fn configure<'a>(
@@ -95,5 +134,43 @@ mod tests {
     fn declares_provider() {
         let b = PbsBackend::new("pbs");
         assert_eq!(b.provider(), "pbs");
+    }
+
+    #[test]
+    fn docker_is_a_declared_runtime() {
+        assert!(PbsBackend::new("pbs").runtimes().contains(&Runtime::Docker));
+    }
+
+    #[tokio::test]
+    async fn docker_workload_spec_carries_config_volume_and_port() {
+        let b = PbsBackend::new("pbs");
+        let ep = Endpoint {
+            name: "pbs-willow".to_string(),
+            ..Default::default()
+        };
+        let spec = b.workload_spec(Runtime::Docker, &ep).await.unwrap();
+
+        assert_eq!(spec.name, "pbs-willow");
+        assert_eq!(spec.image.as_deref(), Some("ghcr.io/argyle-labs/pbs:4.2"));
+        // Falls back to the default port when the endpoint declares no lan_v4 route.
+        assert_eq!(spec.ports, vec!["8007:8007".to_string()]);
+
+        // The config volume is what preserves authkey/proxy.pem across a
+        // container recreate — without it every client re-verifies a new cert.
+        let cfg = spec
+            .mounts
+            .iter()
+            .find(|m| m.target == "/etc/proxmox-backup")
+            .expect("config mount");
+        assert_eq!(cfg.source, "pbs-willow-config");
+        assert!(!cfg.read_only);
+    }
+
+    #[tokio::test]
+    async fn lxc_and_vm_remain_unimplemented() {
+        let b = PbsBackend::new("pbs");
+        let ep = Endpoint::default();
+        assert!(b.workload_spec(Runtime::Lxc, &ep).await.is_err());
+        assert!(b.workload_spec(Runtime::Vm, &ep).await.is_err());
     }
 }
