@@ -104,7 +104,11 @@ jobs:
       # exposed to consumers. Both daemons must come up for /ping to answer.
       - name: Smoke test
         run: |
-          docker run -d --name pbs-smoke -p 8007:8007 pbs:ci
+          # Mirrors the documented runtime shape: PBS needs /run/proxmox-backup
+          # on tmpfs or traffic control silently fails to load.
+          docker run -d --name pbs-smoke -p 8007:8007 \
+            --tmpfs /run/proxmox-backup:rw,nosuid,nodev,mode=0755 \
+            pbs:ci
           for i in $(seq 1 60); do
             if curl -fsk https://127.0.0.1:8007/api2/json/ping >/dev/null 2>&1; then
               echo "PBS answered on :8007"; docker rm -f pbs-smoke; exit 0

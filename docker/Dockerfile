@@ -11,7 +11,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl gnupg tini procps \
+      ca-certificates curl gnupg tini procps util-linux \
  && curl -fsSL https://enterprise.proxmox.com/debian/proxmox-release-trixie.gpg \
       -o /etc/apt/trusted.gpg.d/proxmox-release-trixie.gpg \
  && chmod 0644 /etc/apt/trusted.gpg.d/proxmox-release-trixie.gpg \
