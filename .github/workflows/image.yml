@@ -5,9 +5,12 @@ name: Image
 # built from Proxmox's own `pbs-no-subscription` packages — the provenance stays
 # first-party and no third-party image enters the supply chain.
 #
-# Gitea is the primary remote; GitHub is the mirror. The Gitea push is gated on
-# GITEA_REGISTRY being set so a mirror-side run degrades to ghcr-only instead of
-# failing.
+# Gitea is the primary remote; GitHub is the mirror. Registry coordinates come
+# from the ORG-level `CI_REGISTRY` var + `CI_REGISTRY_USER`/`CI_REGISTRY_TOKEN`
+# secrets that every argyle-labs repo already shares; ghcr uses `GH_TOKEN`
+# (on a Gitea runner the built-in token is a *Gitea* token and cannot auth to
+# ghcr). Each push is gated on its credential existing, so a run degrades to the
+# registry it can reach instead of failing.
 
 on:
   workflow_dispatch:
@@ -30,6 +33,10 @@ on:
 
 env:
   IMAGE_NAME: argyle-labs/pbs
+  # `inputs` is only populated for workflow_dispatch; on a push event it is
+  # empty, which previously skipped both logins while still attempting a push.
+  PUSH: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+  TAG: ${{ inputs.tag || '4.2' }}
 
 jobs:
   image:
@@ -43,30 +50,39 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to ghcr.io
-        if: ${{ inputs.push != false }}
+        if: ${{ env.PUSH == 'true' && secrets.GH_TOKEN != '' }}
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GH_TOKEN }}
 
       - name: Log in to Gitea registry
-        if: ${{ inputs.push != false && vars.GITEA_REGISTRY != '' }}
+        if: ${{ env.PUSH == 'true' && vars.CI_REGISTRY != '' }}
         uses: docker/login-action@v3
         with:
-          registry: ${{ vars.GITEA_REGISTRY }}
-          username: ${{ secrets.GITEA_REGISTRY_USER }}
-          password: ${{ secrets.GITEA_REGISTRY_TOKEN }}
+          registry: ${{ vars.CI_REGISTRY }}
+          username: ${{ secrets.CI_REGISTRY_USER }}
+          password: ${{ secrets.CI_REGISTRY_TOKEN }}
 
       - name: Assemble tags
         id: tags
         run: |
-          TAG="${{ inputs.tag || '4.2' }}"
-          TAGS="ghcr.io/${IMAGE_NAME}:${TAG}"
-          if [ -n "${{ vars.GITEA_REGISTRY }}" ]; then
-            TAGS="${TAGS},${{ vars.GITEA_REGISTRY }}/${IMAGE_NAME}:${TAG}"
+          TAGS=""
+          if [ -n "${{ secrets.GH_TOKEN }}" ]; then
+            TAGS="ghcr.io/${IMAGE_NAME}:${TAG}"
+          fi
+          if [ -n "${{ vars.CI_REGISTRY }}" ]; then
+            [ -n "$TAGS" ] && TAGS="${TAGS},"
+            TAGS="${TAGS}${{ vars.CI_REGISTRY }}/${IMAGE_NAME}:${TAG}"
+          fi
+          if [ -z "$TAGS" ]; then
+            echo "No registry credentials available — nothing to publish." >&2
+            exit 1
           fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          # First tag is whatever registry we can reach; the smoke test pulls it.
+          echo "smoke=${TAGS%%,*}" >> "$GITHUB_OUTPUT"
           echo "Publishing: ${TAGS}"
 
       - name: Build and push
@@ -75,7 +91,7 @@ jobs:
           context: ./docker
           file: ./docker/Dockerfile
           platforms: linux/amd64
-          push: ${{ inputs.push != false }}
+          push: ${{ env.PUSH == 'true' }}
           tags: ${{ steps.tags.outputs.tags }}
           provenance: false
           cache-from: type=gha
@@ -84,10 +100,9 @@ jobs:
       # The image is only useful if PBS actually comes up, so prove both daemons
       # start rather than trusting that the packages installed.
       - name: Smoke test
-        if: ${{ inputs.push != false }}
+        if: ${{ env.PUSH == 'true' }}
         run: |
-          TAG="${{ inputs.tag || '4.2' }}"
-          docker run -d --name pbs-smoke -p 8007:8007 "ghcr.io/${IMAGE_NAME}:${TAG}"
+          docker run -d --name pbs-smoke -p 8007:8007 "${{ steps.tags.outputs.smoke }}"
           for i in $(seq 1 60); do
             if curl -fsk https://127.0.0.1:8007/api2/json/ping >/dev/null 2>&1; then
               echo "PBS responded on :8007"; docker rm -f pbs-smoke; exit 0
