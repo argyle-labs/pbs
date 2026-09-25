@@ -8,13 +8,37 @@ Proxmox Backup Server is a dedicated backup solution for VMs, containers, and ho
 
 A first-party [orca](https://github.com/argyle-labs/orca) plugin (appliance integration).
 
-This plugin **connects orca to an existing pbs install** — there's nothing to deploy here. Stand up pbs from the upstream project, then point orca at it.
+This plugin connects orca to a pbs install, and **can deploy one**: it declares the `docker` / `podman` runtimes and ships the container image this repo builds (`docker/Dockerfile`). Point orca at an existing pbs, or let `service.deploy` stand one up.
 
 ---
 
 ## Run it without orca
 
-Install pbs per the upstream project: <https://www.proxmox.com/en/proxmox-backup-server>. It listens on port `8007` by default; this plugin talks to that endpoint (host, credentials/token) — no container is deployed.
+Install pbs per the upstream project: <https://www.proxmox.com/en/proxmox-backup-server>. It listens on port `8007` by default; this plugin talks to that endpoint (host, credentials/token).
+
+### Container image
+
+Proxmox ships PBS for bare metal and VMs only — there is **no official container image**. This repo builds one from Debian 13 plus Proxmox's own `pbs-no-subscription` repo, so the packages are first-party and no third-party image enters the supply chain.
+
+```
+ghcr.io/argyle-labs/pbs:4.2
+```
+
+Run it directly:
+
+```sh
+docker run -d --name pbs -p 8007:8007 \
+  -v pbs-config:/etc/proxmox-backup \
+  -v pbs-logs:/var/log/proxmox-backup \
+  -v /srv/backups:/mnt/datastore/primary \
+  ghcr.io/argyle-labs/pbs:4.2
+```
+
+`/etc/proxmox-backup` **must** persist: it holds `authkey.key` and `proxy.pem`, which are the server's identity. Keep them and existing PVE clients stay trusted across a container recreate; lose them and every client has to re-verify a new fingerprint.
+
+PBS normally runs as two systemd units (`proxmox-backup` as root, `proxmox-backup-proxy` as `backup`, ordered after it). The image's entrypoint reproduces that ordering and privilege split under `tini`, and exits if either daemon dies so the container restarts as a whole rather than serving with half of PBS up.
+
+Datastore contents are mounted in from outside and are never part of the image or the config volume.
 
 
 See [proxmox-backup-restore.md](docs/proxmox-backup-restore.md) for worked operator notes.

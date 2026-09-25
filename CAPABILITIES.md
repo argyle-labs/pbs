@@ -1,11 +1,11 @@
 # pbs — ServiceBackend contract
 
 Pure-Rust plugin (**no bash/compose/provision scripts**) driven by the single
-generic `service.*` surface — no per-plugin tools. Runtimes: **vm,lxc**.
+generic `service.*` surface — no per-plugin tools. Runtimes: **docker,podman,lxc,vm**.
 
 ## Per-plugin code (the only work this repo owns)
 - [x] `provider` / `runtimes` / `default_port` / `capabilities` / `data_paths` — declarative descriptor
-- [ ] `workload_spec(runtime)` — *what* to run; `deploy_target` renders it to a container / LXC / VM
+- [x] `workload_spec(runtime)` — docker/podman implemented (image + config/log volumes + published port); lxc/vm still unimplemented
 - [ ] `configure` — apply pbs config via its upstream API
 - [ ] `status` — health + rich diagnostics returned in the typed `ServiceStatus.info`
 

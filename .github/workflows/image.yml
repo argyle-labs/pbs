@@ -1,0 +1,97 @@
+name: Image
+
+# Builds the PBS container image from docker/Dockerfile and publishes it to both
+# registries. Upstream Proxmox ships no official PBS image, so this repo owns one
+# built from Proxmox's own `pbs-no-subscription` packages — the provenance stays
+# first-party and no third-party image enters the supply chain.
+#
+# Gitea is the primary remote; GitHub is the mirror. The Gitea push is gated on
+# GITEA_REGISTRY being set so a mirror-side run degrades to ghcr-only instead of
+# failing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (e.g. 4.2, 4.2.6, latest)"
+        required: true
+        type: string
+        default: "4.2"
+      push:
+        description: "Push to registries (off = build only)"
+        required: true
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - "docker/**"
+      - ".github/workflows/image.yml"
+
+env:
+  IMAGE_NAME: argyle-labs/pbs
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        if: ${{ inputs.push != false }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Gitea registry
+        if: ${{ inputs.push != false && vars.GITEA_REGISTRY != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.GITEA_REGISTRY }}
+          username: ${{ secrets.GITEA_REGISTRY_USER }}
+          password: ${{ secrets.GITEA_REGISTRY_TOKEN }}
+
+      - name: Assemble tags
+        id: tags
+        run: |
+          TAG="${{ inputs.tag || '4.2' }}"
+          TAGS="ghcr.io/${IMAGE_NAME}:${TAG}"
+          if [ -n "${{ vars.GITEA_REGISTRY }}" ]; then
+            TAGS="${TAGS},${{ vars.GITEA_REGISTRY }}/${IMAGE_NAME}:${TAG}"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Publishing: ${TAGS}"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker
+          file: ./docker/Dockerfile
+          platforms: linux/amd64
+          push: ${{ inputs.push != false }}
+          tags: ${{ steps.tags.outputs.tags }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The image is only useful if PBS actually comes up, so prove both daemons
+      # start rather than trusting that the packages installed.
+      - name: Smoke test
+        if: ${{ inputs.push != false }}
+        run: |
+          TAG="${{ inputs.tag || '4.2' }}"
+          docker run -d --name pbs-smoke -p 8007:8007 "ghcr.io/${IMAGE_NAME}:${TAG}"
+          for i in $(seq 1 60); do
+            if curl -fsk https://127.0.0.1:8007/api2/json/ping >/dev/null 2>&1; then
+              echo "PBS responded on :8007"; docker rm -f pbs-smoke; exit 0
+            fi
+            sleep 2
+          done
+          echo "PBS never answered on :8007"; docker logs pbs-smoke; docker rm -f pbs-smoke; exit 1
