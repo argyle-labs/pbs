@@ -102,23 +102,36 @@ jobs:
 
       # Prove PBS actually starts BEFORE publishing, so a broken image is never
       # exposed to consumers. Both daemons must come up for /ping to answer.
+      # Probe from INSIDE the container. The job itself runs in a container on
+      # the Gitea runner, so `-p 8007:8007` publishes on the docker HOST, not in
+      # this job's network namespace — a localhost probe from here can never
+      # reach it regardless of whether PBS is healthy. Exec'ing into the
+      # container's own netns tests the thing we actually care about (does PBS
+      # serve?) and makes no assumption about runner topology.
       - name: Smoke test
         run: |
-          # Mirrors the documented runtime shape: PBS needs /run/proxmox-backup
-          # on tmpfs or traffic control silently fails to load.
-          docker run -d --name pbs-smoke -p 8007:8007 \
+          docker run -d --name pbs-smoke \
             --tmpfs /run/proxmox-backup:rw,nosuid,nodev,mode=0755 \
             pbs:ci
           for i in $(seq 1 60); do
-            if curl -fsk https://127.0.0.1:8007/api2/json/ping >/dev/null 2>&1; then
-              echo "PBS answered on :8007"; docker rm -f pbs-smoke; exit 0
+            if docker exec pbs-smoke curl -fsk https://127.0.0.1:8007/api2/json/ping >/dev/null 2>&1; then
+              echo "PBS answered after ~$((i*2))s"
+              # Both daemons must be up with the right identities, not just one.
+              docker exec pbs-smoke ps -eo user,comm | grep proxmox-backup
+              docker exec pbs-smoke ps -eo user,comm | grep -q '^root .*proxmox-backup' \
+                || { echo "api not running as root"; exit 1; }
+              docker exec pbs-smoke ps -eo user,comm | grep -q '^backup .*proxmox-backup' \
+                || { echo "proxy not running as backup"; exit 1; }
+              # A missing tmpfs degrades traffic control silently — fail on it.
+              if docker logs pbs-smoke 2>&1 | grep -q 'not on tmpfs'; then
+                echo "traffic control degraded: /run/proxmox-backup not tmpfs"; exit 1
+              fi
+              docker rm -f pbs-smoke; exit 0
             fi
             sleep 2
           done
-          echo "PBS never answered on :8007"; docker logs pbs-smoke; docker rm -f pbs-smoke; exit 1
+          echo "PBS never answered"; docker logs pbs-smoke; docker rm -f pbs-smoke; exit 1
 
-      # Gitea first: it is the primary registry and the one the fleet pulls from,
-      # so it lands even if ghcr is misconfigured.
       - name: Push to Gitea registry
         if: ${{ env.PUSH == 'true' && vars.CI_REGISTRY != '' }}
         run: |
