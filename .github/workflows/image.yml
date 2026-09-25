@@ -81,32 +81,50 @@ jobs:
             exit 1
           fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-          # First tag is whatever registry we can reach; the smoke test pulls it.
-          echo "smoke=${TAGS%%,*}" >> "$GITHUB_OUTPUT"
           echo "Publishing: ${TAGS}"
 
-      - name: Build and push
+      # Build ONCE into the local daemon. Pushing is deliberately separate: a
+      # single buildx invocation carrying both tags pushes atomically, so one
+      # registry rejecting the token aborts the other too — which is how a ghcr
+      # scope error previously stopped the image reaching Gitea at all.
+      - name: Build
         uses: docker/build-push-action@v6
         with:
           context: ./docker
           file: ./docker/Dockerfile
           platforms: linux/amd64
-          push: ${{ env.PUSH == 'true' }}
-          tags: ${{ steps.tags.outputs.tags }}
+          push: false
+          load: true
+          tags: pbs:ci
           provenance: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # The image is only useful if PBS actually comes up, so prove both daemons
-      # start rather than trusting that the packages installed.
+      # Prove PBS actually starts BEFORE publishing, so a broken image is never
+      # exposed to consumers. Both daemons must come up for /ping to answer.
       - name: Smoke test
-        if: ${{ env.PUSH == 'true' }}
         run: |
-          docker run -d --name pbs-smoke -p 8007:8007 "${{ steps.tags.outputs.smoke }}"
+          docker run -d --name pbs-smoke -p 8007:8007 pbs:ci
           for i in $(seq 1 60); do
             if curl -fsk https://127.0.0.1:8007/api2/json/ping >/dev/null 2>&1; then
-              echo "PBS responded on :8007"; docker rm -f pbs-smoke; exit 0
+              echo "PBS answered on :8007"; docker rm -f pbs-smoke; exit 0
             fi
             sleep 2
           done
           echo "PBS never answered on :8007"; docker logs pbs-smoke; docker rm -f pbs-smoke; exit 1
+
+      # Gitea first: it is the primary registry and the one the fleet pulls from,
+      # so it lands even if ghcr is misconfigured.
+      - name: Push to Gitea registry
+        if: ${{ env.PUSH == 'true' && vars.CI_REGISTRY != '' }}
+        run: |
+          REF="${{ vars.CI_REGISTRY }}/${IMAGE_NAME}:${TAG}"
+          docker tag pbs:ci "$REF"
+          docker push "$REF"
+
+      - name: Push to ghcr.io
+        if: ${{ env.PUSH == 'true' && secrets.GH_TOKEN != '' }}
+        run: |
+          REF="ghcr.io/${IMAGE_NAME}:${TAG}"
+          docker tag pbs:ci "$REF"
+          docker push "$REF"
