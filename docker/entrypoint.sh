@@ -35,10 +35,22 @@ if [[ "$OLD_UID" != "$PUID" || "$OLD_GID" != "$PGID" ]]; then
   # root-owned files keep their ownership: authkey.key is root:root 0600, while
   # authkey.pub and csrf.key are root:backup 0640 — the group moves, the owner
   # must not.
-  if [[ -d /etc/proxmox-backup ]]; then
-    find /etc/proxmox-backup -uid "$OLD_UID" -exec chown -h "$PUID" {} + 2>/dev/null || true
-    find /etc/proxmox-backup -gid "$OLD_GID" -exec chgrp -h "$PGID" {} + 2>/dev/null || true
-  fi
+  #
+  # EVERY persistent path the old uid could own has to be covered, not just the
+  # config dir. The proxy runs as `backup` and writes /var/log/proxmox-backup/{api,
+  # tasks}, so leaving those on the old uid kills it on startup with
+  #   Error: open "/var/log/proxmox-backup/api/access.log" failed - EACCES
+  # and the container crash-loops. /var/lib is included for the same reason: the
+  # dir itself is re-chowned below, but anything already inside it is not.
+  #
+  # Datastore mounts are deliberately NOT listed. They come from outside, can hold
+  # millions of chunk files, and their ownership belongs to whoever provisioned the
+  # share — walking them here would stall every start.
+  for state_dir in /etc/proxmox-backup /var/log/proxmox-backup /var/lib/proxmox-backup; do
+    [[ -d "$state_dir" ]] || continue
+    find "$state_dir" -uid "$OLD_UID" -exec chown -h "$PUID" {} + 2>/dev/null || true
+    find "$state_dir" -gid "$OLD_GID" -exec chgrp -h "$PGID" {} + 2>/dev/null || true
+  done
 fi
 
 # PBS logs to syslog, which a container has no daemon for; it warns once
