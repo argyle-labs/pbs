@@ -233,9 +233,11 @@ pub fn confirm(tool: &str, steps: Vec<Step>, items: &[String]) -> Result<(Vec<St
 }
 
 /// A confirmed item bound to contents (its target carries `#`) that is no
-/// longer planned is a refusal, not a skip: the backups it named have changed
-/// since the dry run. Called before any write, so nothing else in the plan
-/// runs either.
+/// longer planned is a refusal, not a skip: the backups it named changed or
+/// vanished since the dry run. Called before any write, so nothing else in
+/// the plan runs either. The check is a fresh read just before the writes;
+/// PBS has no conditional delete, so a backup finishing between that read
+/// and the DELETE is still removed.
 pub fn refuse_drifted(tool: &str, steps: &[Step], items: &[String]) -> Result<()> {
     let drifted: Vec<&str> = items
         .iter()
@@ -244,7 +246,7 @@ pub fn refuse_drifted(tool: &str, steps: &[Step], items: &[String]) -> Result<()
         .collect();
     if !drifted.is_empty() {
         bail!(
-            "{tool}: refusing: {} changed since the dry run; re-run it and confirm the new items",
+            "{tool}: refusing: {} changed or vanished since the dry run; re-run it and confirm the new items",
             drifted.join(", ")
         );
     }

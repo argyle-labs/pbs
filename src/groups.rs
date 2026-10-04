@@ -293,7 +293,8 @@ async fn group_delete(
         args.all_datastores,
     );
     if args.execute {
-        refuse_changed_groups(TOOL, &steps, &args.items)?;
+        plan::authorize_execute(TOOL, caller)?;
+        plan::refuse_drifted(TOOL, &steps, &args.items)?;
     }
     let summary = format!("delete group {}/{}", args.backup_type, args.backup_id);
     plan::plan_or_apply(
@@ -308,25 +309,6 @@ async fn group_delete(
         Some(&args.items),
     )
     .await
-}
-
-/// A confirmed group whose snapshot count or last backup moved since the dry
-/// run is a refusal, not a skip: the operator approved deleting what they saw.
-/// The check runs on a fresh read just before the DELETE; PBS has no
-/// conditional delete, so a backup finishing in the milliseconds between
-/// that read and the DELETE is still removed with the group.
-pub fn refuse_changed_groups(tool: &str, steps: &[Step], items: &[String]) -> Result<()> {
-    let changed: Vec<&String> = items
-        .iter()
-        .filter(|i| !steps.iter().any(|s| s.item() == **i))
-        .collect();
-    if !changed.is_empty() {
-        bail!(
-            "{tool}: refusing: {} changed or vanished since the dry run; re-run it and confirm the new items",
-            changed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-        );
-    }
-    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -860,9 +842,9 @@ mod tests {
         grown[0].backup_count += 1;
         let (now, _) =
             group_delete_steps(&[("main".to_string(), grown)], &None, "vm", "111", false);
-        let err = refuse_changed_groups("pbs.group.delete", &now, &confirmed).unwrap_err();
+        let err = plan::refuse_drifted("pbs.group.delete", &now, &confirmed).unwrap_err();
         assert!(err.to_string().contains("changed or vanished"), "{err}");
-        assert!(refuse_changed_groups("pbs.group.delete", &planned, &confirmed).is_ok());
+        assert!(plan::refuse_drifted("pbs.group.delete", &planned, &confirmed).is_ok());
     }
 
     #[test]

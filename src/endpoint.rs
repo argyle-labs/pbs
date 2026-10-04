@@ -264,8 +264,8 @@ pub struct PbsUpdateOutput {
     pub applied: Vec<String>,
 }
 
-/// Patch a PBS endpoint. Secrets are written to the secrets domain only after
-/// the row update succeeds.
+/// Patch a PBS endpoint. Everything is validated before the first write. A new
+/// token secret is written before the row, then the row, then the pin.
 #[orca_tool(domain = "pbs", verb = "update")]
 async fn pbs_update(args: PbsUpdateArgs, _ctx: &ToolCtx) -> Result<PbsUpdateOutput> {
     validate_name(&args.name)?;
@@ -315,8 +315,11 @@ async fn pbs_update(args: PbsUpdateArgs, _ctx: &ToolCtx) -> Result<PbsUpdateOutp
             applied.join(", ")
         )
     };
-    // The secret goes first: a row naming a new token_id beside the old
-    // token's secret would authenticate as nothing.
+    // The secret goes first so a new token_id never sits beside the old
+    // token's secret. If the row write then fails, the endpoint holds the old
+    // token_id with the new secret and cannot authenticate; the old secret is
+    // gone, so the fix is forward: re-run the same update, which works because
+    // the staged copy is only deleted on success.
     if let Some(s) = &token_secret {
         store_secrets(&row.name, Some(s), None)?;
         applied.push("token_secret".to_string());
@@ -754,6 +757,10 @@ mod tests {
         .to_string();
         assert!(err.contains("already applied: [token_secret]"), "{err}");
         assert!(!err.contains("tok-secret-2"), "{err}");
+        assert!(
+            store.borrow().secrets.contains_key("pbs.willow.staged"),
+            "the staged copy is kept so re-running the update heals it"
+        );
     }
 
     /// A new token_id must never sit beside the old token's secret: if the
