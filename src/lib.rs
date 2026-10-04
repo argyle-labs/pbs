@@ -55,6 +55,67 @@ fn resolve_image(override_value: Option<String>) -> String {
         .unwrap_or_else(|| format!("{DEFAULT_IMAGE}:{IMAGE_TAG}"))
 }
 
+const CONFIG_DIR: &str = "/etc/proxmox-backup";
+const LIB_DIR: &str = "/var/lib/proxmox-backup";
+const LOG_DIR: &str = "/var/log/proxmox-backup";
+const RUN_DIR: &str = "/run/proxmox-backup";
+
+/// Every config file PBS 4.x may keep under [`CONFIG_DIR`] (a trailing `/`
+/// marks a directory). Most only appear once the feature is configured.
+/// Users and their API tokens live in `user.cfg`; token secrets in
+/// `token.shadow`; sync-remote credentials in `remote.cfg`; `authkey.*` and
+/// `proxy.*` are the server identity.
+pub const RESTORE_CRITICAL: &[&str] = &[
+    "datastore.cfg",
+    "user.cfg",
+    "shadow.json",
+    "token.shadow",
+    "tfa.json",
+    "acl.cfg",
+    "domains.cfg",
+    "ldap_passwords.json",
+    "remote.cfg",
+    "sync.cfg",
+    "verification.cfg",
+    "prune.cfg",
+    "traffic-control.cfg",
+    "node.cfg",
+    "acme/",
+    "notifications.cfg",
+    "notifications-priv.cfg",
+    "metricserver.cfg",
+    "tape.cfg",
+    "tape-job.cfg",
+    "media-pool.cfg",
+    "tape-encryption-keys.json",
+    "tape-encryption-key-config.json",
+    "s3.cfg",
+    "subscription",
+    "authkey.key",
+    "authkey.pub",
+    "csrf.key",
+    "proxy.key",
+    "proxy.pem",
+];
+
+/// Named volume holding [`CONFIG_DIR`]. For the instance `pbs` this is
+/// `pbs-config`, the volume the live container and the README's `docker run`
+/// use, so a redeploy reattaches the existing config instead of starting empty.
+pub fn config_volume(instance: &str) -> String {
+    format!("{instance}-config")
+}
+
+/// Named volume holding [`LOG_DIR`] (`pbs-logs` for instance `pbs`).
+pub fn logs_volume(instance: &str) -> String {
+    format!("{instance}-logs")
+}
+
+/// Named volume holding [`LIB_DIR`]: job last-run state, tape inventory and
+/// catalogs, and RRD metrics, all lost on a container recreate without it.
+pub fn lib_volume(instance: &str) -> String {
+    format!("{instance}-lib")
+}
+
 /// pbs backend. Holds only the provider name; per-instance endpoint/creds
 /// come from the instance id and `Routes` the generic `service.*` tools hand each op.
 #[derive(Debug, Clone)]
@@ -99,13 +160,15 @@ impl ServiceBackend for PbsBackend {
     /// Proxmox guests when available) snapshots these. No backup/restore code
     /// here; those are inherited from ServiceBackend's defaults.
     fn data_paths(&self) -> Vec<String> {
-        // PBS keeps its whole config surface — datastore.cfg, user.cfg, acl.cfg,
-        // plus `authkey.key` and `proxy.pem` — under one directory. Those keys
-        // ARE the server identity: restore them and existing clients keep their
-        // trust, lose them and every PVE host must re-verify a new fingerprint.
-        // Datastore *contents* are deliberately not listed: they are the backups
-        // themselves, mounted in from outside and never captured by this path.
-        vec!["/etc/proxmox-backup".to_string()]
+        // PBS keeps its whole config surface (see `RESTORE_CRITICAL`) under one
+        // directory. `authkey.key` and `proxy.pem` ARE the server identity:
+        // restore them and existing clients keep their trust, lose them and
+        // every PVE host must re-verify a new fingerprint. Datastore *contents*
+        // are deliberately not listed: they are the backups themselves, mounted
+        // in from outside and never captured by these paths. `LIB_DIR` holds
+        // job state and the tape inventory/catalog, which a restored server
+        // otherwise rebuilds from scratch.
+        vec![CONFIG_DIR.to_string(), LIB_DIR.to_string()]
     }
 
     fn workload_spec<'a>(
@@ -123,8 +186,15 @@ impl ServiceBackend for PbsBackend {
                     mounts: vec![
                         // Config + server identity. Named volume rather than a
                         // host path so recreating the container is lossless.
-                        Mount::bind(format!("{instance}-config"), "/etc/proxmox-backup"),
-                        Mount::bind(format!("{instance}-logs"), "/var/log/proxmox-backup"),
+                        Mount::bind(config_volume(instance), CONFIG_DIR),
+                        Mount::bind(lib_volume(instance), LIB_DIR),
+                        Mount::bind(logs_volume(instance), LOG_DIR),
+                        // PBS keeps its config-version cache in shared memory
+                        // here and requires tmpfs; on a plain directory the
+                        // server still serves but traffic control never loads.
+                        // The cache is a few KiB; the cap keeps the runtime
+                        // default (half of host RAM) from applying.
+                        Mount::tmpfs(RUN_DIR).with_size("16m"),
                     ],
                     // Datastore mounts are deliberately absent: which paths hold
                     // backups is per-install, so they are supplied as endpoint
@@ -199,6 +269,87 @@ mod tests {
             .expect("config mount");
         assert_eq!(cfg.source, "pbs-willow-config");
         assert!(!cfg.read_only);
+    }
+
+    #[tokio::test]
+    async fn instance_pbs_reattaches_the_live_volumes() {
+        let spec = PbsBackend::new("pbs")
+            .workload_spec(Runtime::Docker, "pbs", &Routes::new())
+            .await
+            .unwrap();
+        let source = |target: &str| {
+            spec.mounts
+                .iter()
+                .find(|m| m.target == target)
+                .map(|m| m.source.clone())
+        };
+        assert_eq!(source("/etc/proxmox-backup").as_deref(), Some("pbs-config"));
+        assert_eq!(
+            source("/var/log/proxmox-backup").as_deref(),
+            Some("pbs-logs")
+        );
+        assert_eq!(
+            source("/var/lib/proxmox-backup").as_deref(),
+            Some("pbs-lib")
+        );
+    }
+
+    #[tokio::test]
+    async fn docker_spec_mounts_run_dir_as_tmpfs() {
+        let spec = PbsBackend::new("pbs")
+            .workload_spec(Runtime::Docker, "pbs", &Routes::new())
+            .await
+            .unwrap();
+        let run = spec
+            .mounts
+            .iter()
+            .find(|m| m.target == "/run/proxmox-backup")
+            .expect("tmpfs mount");
+        assert_eq!(run.kind, plugin_toolkit::deploy_target::MountKind::Tmpfs);
+        assert_eq!(run.size.as_deref(), Some("16m"));
+        assert!(spec.mounts.iter().all(|m| m.validation_error().is_none()));
+    }
+
+    /// Lock files, rotated backups and the `.lock` siblings PBS creates next
+    /// to a config file hold no state of their own.
+    fn transient(name: &str) -> bool {
+        name.starts_with('.') || name.ends_with(".lock") || name.contains(".bak-")
+    }
+
+    #[test]
+    fn every_live_config_file_is_known_and_backed_up() {
+        let live: Vec<&str> = include_str!("../tests/fixtures/etc_proxmox_backup.ls")
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        assert!(live.contains(&"user.cfg") && live.contains(&"token.shadow"));
+        let unknown: Vec<&&str> = live
+            .iter()
+            .filter(|n| !transient(n) && !RESTORE_CRITICAL.contains(n))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "PBS writes files RESTORE_CRITICAL does not list: {unknown:?}"
+        );
+
+        let paths = PbsBackend::new("pbs").data_paths();
+        for f in RESTORE_CRITICAL {
+            let full = format!("{CONFIG_DIR}/{f}");
+            assert!(
+                paths.iter().any(|p| full.starts_with(&format!("{p}/"))),
+                "{full} is not under any data path"
+            );
+        }
+    }
+
+    #[test]
+    fn backup_spec_captures_config_and_lib_with_no_excludes() {
+        let spec = PbsBackend::new("pbs").backup_spec();
+        assert_eq!(
+            spec.include,
+            vec![CONFIG_DIR.to_string(), LIB_DIR.to_string()]
+        );
+        assert!(spec.exclude.is_empty(), "excludes: {:?}", spec.exclude);
     }
 
     #[test]
