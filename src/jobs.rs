@@ -117,15 +117,26 @@ async fn find_job(c: &PbsClient, kind: Kind, id: &str) -> Result<Option<Value>> 
 
 /// The section's config digest, echoed on update so PBS refuses the write if
 /// the job changed since it was read.
-async fn config_digest(c: &PbsClient, kind: Kind, id: &str) -> Result<Option<String>> {
+/// The job's config section and its digest from one read, so the update is
+/// diffed against exactly the version the digest guards. `None` when the
+/// job is not in the list.
+async fn job_config(
+    c: &PbsClient,
+    kind: Kind,
+    id: &str,
+) -> Result<Option<(Value, Option<String>)>> {
+    if find_job(c, kind, id).await?.is_none() {
+        return Ok(None);
+    }
     let env = c
         .get_envelope(&format!("{}/{}", kind.config_path(), encode(id)), &[])
         .await?;
-    Ok(env
+    let digest = env
         .extra
         .get("digest")
         .and_then(Value::as_str)
-        .map(str::to_string))
+        .map(str::to_string);
+    Ok(Some((env.data, digest)))
 }
 
 /// Field changes `desired` makes over `current`, as `(key, old, new)`.
@@ -297,25 +308,46 @@ async fn mutate<A: Serialize>(
     build: impl FnOnce(Option<&Value>, Option<&str>) -> Result<Vec<Step>>,
 ) -> Result<Change> {
     let c = endpoint::connect(endpoint).await?;
-    let existing = find_job(&c, kind, id).await?;
-    let digest = match (&existing, with_digest) {
-        (Some(_), true) => config_digest(&c, kind, id).await?,
-        _ => None,
+    mutate_with(
+        &c,
+        tool,
+        kind,
+        args,
+        id,
+        execute,
+        ctx.caller().as_ref(),
+        with_digest,
+        build,
+    )
+    .await
+}
+
+/// `with_digest` reads the job from its config section (data and digest in
+/// one response) instead of the status list, for an update that must diff
+/// against what the digest protects.
+#[allow(clippy::too_many_arguments)]
+async fn mutate_with<A: Serialize>(
+    c: &PbsClient,
+    tool: &str,
+    kind: Kind,
+    args: &A,
+    id: &str,
+    execute: bool,
+    caller: Option<&plugin_toolkit::contract::CallerIdentity>,
+    with_digest: bool,
+    build: impl FnOnce(Option<&Value>, Option<&str>) -> Result<Vec<Step>>,
+) -> Result<Change> {
+    let (existing, digest) = if with_digest {
+        match job_config(c, kind, id).await? {
+            Some((data, digest)) => (Some(data), digest),
+            None => (None, None),
+        }
+    } else {
+        (find_job(c, kind, id).await?, None)
     };
     let steps = build(existing.as_ref(), digest.as_deref())?;
     let summary = format!("{} job {id}", kind.name());
-    plan::plan_or_apply(
-        tool,
-        args,
-        execute,
-        ctx.caller().as_ref(),
-        &c,
-        summary,
-        steps,
-        vec![],
-        None,
-    )
-    .await
+    plan::plan_or_apply(tool, args, execute, caller, c, summary, steps, vec![], None).await
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -823,6 +855,78 @@ mod tests {
             .unwrap()
             .contains("schedule: \"05:30\" -> \"04:00\""));
         assert!(update_steps(Kind::Sync, None, "nope", Map::new(), &[], None).is_err());
+    }
+
+    /// The status list says 05:30, but the config section (what the digest
+    /// guards) already says 04:00: the update must see no change.
+    #[tokio::test]
+    async fn update_diffs_against_the_config_read_that_carries_the_digest() {
+        let m = MockTransport::new();
+        m.on(Method::Get, "/admin/sync", 200, SYNC_LIST);
+        let mut cfg = sync_job();
+        for k in STATUS_KEYS {
+            cfg.as_object_mut().unwrap().remove(k);
+        }
+        cfg["schedule"] = json!("04:00");
+        m.on(
+            Method::Get,
+            "/config/sync/willow-to-maple",
+            200,
+            &json!({"data": cfg, "digest": "d-config"}).to_string(),
+        );
+        let fields = SyncJobFields {
+            schedule: Some("04:00".into()),
+            comment: Some("new".into()),
+            ..Default::default()
+        }
+        .to_map();
+        let out = mutate_with(
+            &m.client(),
+            "pbs.sync_job.update",
+            Kind::Sync,
+            &json!({}),
+            "willow-to-maple",
+            false,
+            None,
+            true,
+            |e, d| update_steps(Kind::Sync, e, "willow-to-maple", fields, &[], d),
+        )
+        .await
+        .unwrap();
+        let Change::Plan(p) = out else { panic!() };
+        let detail = p.changes[0].detail.as_deref().unwrap();
+        assert!(!detail.contains("schedule"), "{detail}");
+        assert!(detail.contains("comment"), "{detail}");
+        assert!(
+            detail.contains("PUT /config/sync/willow-to-maple"),
+            "{detail}"
+        );
+
+        m.ok(Method::Put, "/config/sync/willow-to-maple", Value::Null);
+        let fields = SyncJobFields {
+            comment: Some("new".into()),
+            ..Default::default()
+        }
+        .to_map();
+        let admin = crate::plan::admin();
+        mutate_with(
+            &m.client(),
+            "pbs.sync_job.update",
+            Kind::Sync,
+            &json!({}),
+            "willow-to-maple",
+            true,
+            Some(&admin),
+            true,
+            |e, d| update_steps(Kind::Sync, e, "willow-to-maple", fields, &[], d),
+        )
+        .await
+        .unwrap();
+        let last = m.calls.lock().unwrap().len() - 1;
+        assert_eq!(
+            m.body_of(last),
+            json!({"comment": "new", "digest": "d-config"})
+        );
     }
 
     #[test]

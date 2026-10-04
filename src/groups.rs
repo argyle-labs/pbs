@@ -270,12 +270,20 @@ pub fn group_delete_steps(
     execute_gated = false
 )]
 pub async fn pbs_group_delete(args: GroupDeleteArgs, ctx: &ToolCtx) -> Result<Change> {
-    const TOOL: &str = "pbs.group.delete";
     let c = endpoint::connect(args.endpoint.as_deref()).await?;
-    let stores = datastores(&c, &args.datastores, args.all_datastores).await?;
+    group_delete(&c, &args, ctx.caller().as_ref()).await
+}
+
+async fn group_delete(
+    c: &PbsClient,
+    args: &GroupDeleteArgs,
+    caller: Option<&plugin_toolkit::contract::CallerIdentity>,
+) -> Result<Change> {
+    const TOOL: &str = "pbs.group.delete";
+    let stores = datastores(c, &args.datastores, args.all_datastores).await?;
     let mut found = Vec::new();
     for s in stores {
-        found.push((s.clone(), groups(&c, &s, &args.ns).await?));
+        found.push((s.clone(), groups(c, &s, &args.ns).await?));
     }
     let (steps, notes) = group_delete_steps(
         &found,
@@ -290,10 +298,10 @@ pub async fn pbs_group_delete(args: GroupDeleteArgs, ctx: &ToolCtx) -> Result<Ch
     let summary = format!("delete group {}/{}", args.backup_type, args.backup_id);
     plan::plan_or_apply(
         TOOL,
-        &args,
+        args,
         args.execute,
-        ctx.caller().as_ref(),
-        &c,
+        caller,
+        c,
         summary,
         steps,
         notes,
@@ -304,10 +312,13 @@ pub async fn pbs_group_delete(args: GroupDeleteArgs, ctx: &ToolCtx) -> Result<Ch
 
 /// A confirmed group whose snapshot count or last backup moved since the dry
 /// run is a refusal, not a skip: the operator approved deleting what they saw.
+/// The check runs on a fresh read just before the DELETE; PBS has no
+/// conditional delete, so a backup finishing in the milliseconds between
+/// that read and the DELETE is still removed with the group.
 pub fn refuse_changed_groups(tool: &str, steps: &[Step], items: &[String]) -> Result<()> {
     let changed: Vec<&String> = items
         .iter()
-        .filter(|i| !steps.iter().any(|s| &s.target == *i))
+        .filter(|i| !steps.iter().any(|s| s.item() == **i))
         .collect();
     if !changed.is_empty() {
         bail!(
@@ -528,7 +539,9 @@ pub fn prune_steps(
                 .max()
                 .unwrap_or_default();
             let mut detail = format!(
-                "removes {} snapshots ({} .. {}), keeps {kept}",
+                "removes {} snapshots ({} .. {}), keeps {kept}; PBS re-applies the keep \
+                 rules at execute, so a snapshot taken after this dry run can shift which \
+                 ones go",
                 doomed.len(),
                 times::utc(oldest),
                 times::utc(newest)
@@ -1004,5 +1017,46 @@ mod tests {
             rt.block_on(datastores(&c, &["a".into()], false)).unwrap(),
             vec!["a"]
         );
+    }
+
+    #[tokio::test]
+    async fn group_delete_refuses_at_execute_when_the_group_changed() {
+        let m = MockTransport::new();
+        m.on(
+            Method::Get,
+            "/admin/datastore/main/groups",
+            200,
+            GROUPS_LIST,
+        );
+        m.on(
+            Method::Delete,
+            "/admin/datastore/main/groups",
+            200,
+            GROUP_DELETE,
+        );
+        let mut args = GroupDeleteArgs {
+            datastores: vec!["main".into()],
+            backup_type: "vm".into(),
+            backup_id: "111".into(),
+            ..Default::default()
+        };
+        let Change::Plan(p) = group_delete(&m.client(), &args, None).await.unwrap() else {
+            panic!("expected plan")
+        };
+        let mut grown: Value = serde_json::from_str(GROUPS_LIST).unwrap();
+        grown["data"][0]["backup-count"] = json!(13);
+        m.on(
+            Method::Get,
+            "/admin/datastore/main/groups",
+            200,
+            &grown.to_string(),
+        );
+        args.execute = true;
+        args.items = p.changes.iter().map(|c| c.target.clone()).collect();
+        let err = group_delete(&m.client(), &args, Some(&admin()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("changed or vanished"), "{err}");
+        assert!(m.mutations().is_empty(), "{:?}", m.mutations());
     }
 }

@@ -168,6 +168,10 @@ pub enum SecretState {
     Rejected,
     /// The check itself failed; nothing is concluded.
     Unknown,
+    /// Not probed: the token or its user is disabled or expired, and PBS
+    /// answers 401 for an inactive auth id before it looks at the secret
+    /// (`proxmox-auth-api` `http_check_auth`), so a 401 would say nothing.
+    Inactive,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +182,8 @@ pub struct State {
     pub acl_digest: Option<String>,
     pub secret: SecretState,
     pub now: i64,
+    /// Contents of the host namespace, read only when revoke deletes data.
+    pub ns_contents: Option<api::NsContents>,
 }
 
 fn user_target(id: &Identity) -> String {
@@ -201,8 +207,9 @@ fn acl_put(path: &str, role: &str, auth: &str, delete: bool) -> Value {
 }
 
 /// Echo the `acl.cfg` digest on the first ACL write only: that write changes
-/// the digest, so later writes would be refused if they carried it too.
-fn stamp_acl_digest(steps: &mut [Step], digest: Option<&str>) {
+/// the digest, so later writes would be refused if they carried it too. Call
+/// it on the confirmed steps, so the write that carries it is one that runs.
+pub fn stamp_acl_digest(steps: &mut [Step], digest: Option<&str>) {
     let Some(d) = digest else { return };
     let first = steps.iter_mut().find_map(|s| match &mut s.call {
         ApiCall::Put { path, body } if path == "/access/acl" => Some(body),
@@ -299,7 +306,22 @@ pub fn diff_enroll(id: &Identity, st: &State, adopt: bool) -> Result<(Vec<Findin
                     format!("{} is disabled or expired", id.tokenid),
                 ));
             }
+            let user_inactive = user.is_some_and(|u| !api::is_active(u.enable, u.expire, st.now));
             let rotate = match st.secret {
+                // Re-enabling restores the old secret's validity, so it is
+                // never regenerated while inactive; the next run probes it.
+                _ if inactive || user_inactive => {
+                    findings.push(finding(
+                        "secret-unverified",
+                        format!(
+                            "{} or its user is inactive; its secret is neither checked nor \
+                             regenerated until it is enabled, so re-run enroll afterwards",
+                            id.tokenid
+                        ),
+                    ));
+                    false
+                }
+                SecretState::Inactive => false,
                 SecretState::Missing => {
                     findings.push(finding(
                         "secret-missing",
@@ -392,7 +414,6 @@ pub fn diff_enroll(id: &Identity, st: &State, adopt: bool) -> Result<(Vec<Findin
         steps.push(revoke_acl(e));
     }
 
-    stamp_acl_digest(&mut steps, st.acl_digest.as_deref());
     Ok((findings, steps))
 }
 
@@ -423,7 +444,6 @@ pub fn diff_revoke(
         .filter(|e| id.owns(e))
         .map(revoke_acl)
         .collect();
-    stamp_acl_digest(&mut steps, st.acl_digest.as_deref());
     let mut notes = Vec::new();
     if user.is_some_and(|u| u.tokens.iter().any(|t| t.tokenid == id.tokenid)) {
         steps.push(Step::new(
@@ -448,8 +468,13 @@ pub fn diff_revoke(
     let ns_exists = st.namespaces.iter().any(|n| n.ns == id.ns);
     match (ns_exists, delete_data) {
         (true, true) => {
-            let (ns_steps, _) =
-                crate::tools::namespace_delete_steps(&id.datastore, &st.namespaces, &id.ns, true);
+            let contents = st.ns_contents.unwrap_or_default();
+            let (ns_steps, _) = crate::tools::namespace_delete_steps(
+                &id.datastore,
+                &st.namespaces,
+                &id.ns,
+                Some(&contents),
+            );
             steps.extend(ns_steps);
         }
         (true, false) => notes.push(format!(
@@ -477,13 +502,25 @@ async fn check_secret(c: &PbsClient, tokenid: &str, stored: Option<String>) -> S
 
 async fn read_state(c: &PbsClient, id: &Identity, stored: Option<String>) -> Result<State> {
     let (acls, acl_digest) = api::acls_with_digest(c).await?;
+    let users = api::users(c).await?;
+    let now = plugin_toolkit::time::now().unix_seconds();
+    let user = users.iter().find(|u| u.userid == id.userid);
+    let token = user.and_then(|u| u.tokens.iter().find(|t| t.tokenid == id.tokenid));
+    let inactive = user.is_some_and(|u| !api::is_active(u.enable, u.expire, now))
+        || token.is_some_and(|t| !api::is_active(t.enable, t.expire, now));
+    let secret = if inactive && stored.is_some() {
+        SecretState::Inactive
+    } else {
+        check_secret(c, &id.tokenid, stored).await
+    };
     Ok(State {
         namespaces: api::namespaces(c, &id.datastore).await?,
-        users: api::users(c).await?,
+        users,
         acls,
         acl_digest,
-        secret: check_secret(c, &id.tokenid, stored).await,
-        now: plugin_toolkit::time::now().unix_seconds(),
+        secret,
+        now,
+        ns_contents: None,
     })
 }
 
@@ -590,7 +627,8 @@ async fn enroll(
         return Ok(out);
     }
     plan::authorize_execute(TOOL, caller)?;
-    let (steps, notes) = plan::confirm(TOOL, steps, &args.items)?;
+    let (mut steps, notes) = plan::confirm(TOOL, steps, &args.items)?;
+    stamp_acl_digest(&mut steps, st.acl_digest.as_deref());
     let desc = format!("PBS token {} (pbs endpoint '{ep}')", id.tokenid);
     let mut stored_now = false;
     let results = plan::run_with(TOOL, c, &steps, |step, reply| {
@@ -683,13 +721,20 @@ async fn revoke(
     const TOOL: &str = "pbs.host.revoke";
     id.check_not_self(c)?;
     let (acls, acl_digest) = api::acls_with_digest(c).await?;
+    let namespaces = api::namespaces(c, &id.datastore).await?;
+    let ns_contents = if args.delete_data && namespaces.iter().any(|n| n.ns == id.ns) {
+        Some(api::ns_contents(c, &id.datastore, &namespaces, &id.ns).await?)
+    } else {
+        None
+    };
     let st = State {
-        namespaces: api::namespaces(c, &id.datastore).await?,
+        namespaces,
         users: api::users(c).await?,
         acls,
         acl_digest,
         secret: SecretState::Unknown,
         now: 0,
+        ns_contents,
     };
     let token_exists = st
         .users
@@ -711,7 +756,8 @@ async fn revoke(
         });
     }
     plan::authorize_execute(TOOL, caller)?;
-    let (steps, dropped) = plan::confirm(TOOL, steps, &args.items)?;
+    let (mut steps, dropped) = plan::confirm(TOOL, steps, &args.items)?;
+    stamp_acl_digest(&mut steps, st.acl_digest.as_deref());
     notes.extend(dropped);
     let results = plan::run(TOOL, c, &steps).await?;
     let token_gone = !token_exists || steps.iter().any(|s| s.action == "delete-token");
@@ -747,6 +793,7 @@ mod tests {
             acl_digest: Some(DIGEST.into()),
             secret,
             now: 1_759_600_000,
+            ns_contents: None,
         }
     }
 
@@ -833,10 +880,16 @@ mod tests {
                 body: json!({"userid": "willow@pbs", "comment": "orca: backup client for willow"}),
             }
         );
-        let ApiCall::Put { body, .. } = &steps[3].call else {
+        let mut stamped = steps.clone();
+        stamp_acl_digest(&mut stamped, Some(DIGEST));
+        let ApiCall::Put { body, .. } = &stamped[3].call else {
             panic!()
         };
         assert_eq!(body["digest"], DIGEST, "first ACL write carries the digest");
+        let ApiCall::Put { body, .. } = &stamped[4].call else {
+            panic!()
+        };
+        assert!(body.get("digest").is_none(), "only the first ACL write");
         assert_eq!(
             steps[6].call,
             ApiCall::Put {
@@ -870,8 +923,7 @@ mod tests {
                     "path": "/datastore/main",
                     "role": "DatastoreAdmin",
                     "auth-id": "freyr@pbs!backup",
-                    "delete": true,
-                    "digest": DIGEST
+                    "delete": true
                 }),
             }
         );
@@ -960,21 +1012,49 @@ mod tests {
         assert!(!steps.iter().any(|s| s.action == "regenerate-token"));
     }
 
+    /// Through the real read path: an expired token with a stored secret is
+    /// not probed (PBS would 401 on the inactive id regardless of the
+    /// secret) and gets enable only, never regenerate.
     #[test]
-    fn expired_token_is_reactivated() {
-        let id = Identity::new("freyr", "main").unwrap();
-        let mut st = state(SecretState::Valid);
-        st.users[1].tokens[0].expire = Some(1);
-        let (f, steps) = diff_enroll(&id, &st, false).unwrap();
-        assert!(kinds(&f).contains(&"token-inactive"));
-        let s = steps.iter().find(|s| s.action == "enable-token").unwrap();
-        assert_eq!(
-            s.call,
-            ApiCall::Put {
-                path: "/access/users/freyr%40pbs/token/backup".into(),
-                body: json!({"enable": true, "expire": 0}),
-            }
+    fn expired_token_is_reactivated_not_regenerated() {
+        let store = Rc::new(RefCell::new(Store::default()));
+        store.borrow_mut().secrets.insert(
+            "pbs.willow-pbs.host_freyr_token".into(),
+            "good-secret".into(),
         );
+        let m = enroll_mock();
+        let mut users: Value = serde_json::from_str(USERS_LIST).unwrap();
+        users["data"][1]["tokens"][0]["expire"] = json!(1);
+        m.on(Method::Get, "/access/users", 200, &users.to_string());
+        m.on(
+            Method::Get,
+            "/version",
+            401,
+            r#"{"data":null,"message":"user account or token disabled or expired."}"#,
+        );
+        let out = run_enroll(&store, &m, enroll_args("freyr", false, vec![])).unwrap();
+        assert!(
+            !m.log().iter().any(|l| l.contains("/version")),
+            "an inactive token must not be probed"
+        );
+        assert!(kinds(&out.findings).contains(&"token-inactive"));
+        assert!(!kinds(&out.findings).contains(&"token-rotated"));
+        let Change::Plan(p) = out.change else {
+            panic!()
+        };
+        let actions: Vec<&str> = p.changes.iter().map(|c| c.action.as_str()).collect();
+        assert!(actions.contains(&"enable-token"), "{actions:?}");
+        assert!(!actions.contains(&"regenerate-token"), "{actions:?}");
+    }
+
+    #[test]
+    fn disabled_user_blocks_regeneration_even_with_a_rejected_secret() {
+        let id = Identity::new("freyr", "main").unwrap();
+        let mut st = state(SecretState::Rejected);
+        st.users[1].enable = Some(false);
+        let (_, steps) = diff_enroll(&id, &st, false).unwrap();
+        assert!(steps.iter().any(|s| s.action == "update-user"));
+        assert!(!steps.iter().any(|s| s.action == "regenerate-token"));
     }
 
     #[test]
@@ -1095,7 +1175,10 @@ mod tests {
     fn execute_applies_only_confirmed_items() {
         let store = Rc::new(RefCell::new(Store::default()));
         let m = enroll_mock();
-        let items = vec!["main:hosts/willow".to_string(), "acl:gone".to_string()];
+        let items = vec![
+            "create-namespace main:hosts/willow".to_string(),
+            "acl:gone".to_string(),
+        ];
         let out = run_enroll(&store, &m, enroll_args("willow", true, items)).unwrap();
         assert_eq!(m.mutations(), vec!["POST /admin/datastore/main/namespace"]);
         let Change::Applied(a) = out.change else {
@@ -1125,6 +1208,14 @@ mod tests {
         let json = serde_json::to_string(&out).unwrap();
         assert!(!json.contains(minted), "secret leaked into output");
         assert_eq!(m.mutations().len(), 7);
+        let calls = m.calls.lock().unwrap();
+        let acl_bodies: Vec<Value> = calls
+            .iter()
+            .filter(|c| c.url.ends_with("/access/acl") && c.method == Method::Put)
+            .map(|c| serde_json::from_slice(c.body.as_deref().unwrap()).unwrap())
+            .collect();
+        assert_eq!(acl_bodies[0]["digest"], DIGEST, "first executed ACL write");
+        assert!(acl_bodies[1..].iter().all(|b| b.get("digest").is_none()));
     }
 
     #[test]
@@ -1264,7 +1355,9 @@ mod tests {
             .secrets
             .insert("pbs.willow-pbs.host_freyr_token".into(), "s".into());
         let m = revoke_mock();
-        let items = vec!["acl:freyr@pbs!backup:/datastore/main:DatastoreAdmin".to_string()];
+        let items = vec![
+            "revoke-DatastoreAdmin acl:freyr@pbs!backup:/datastore/main:DatastoreAdmin".to_string(),
+        ];
         let out = run_revoke(&store, &m, items, true).unwrap();
         assert!(!out.secret_removed);
         assert_eq!(m.mutations(), vec!["PUT /access/acl"]);

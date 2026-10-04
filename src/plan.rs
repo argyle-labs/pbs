@@ -76,14 +76,19 @@ impl Step {
         self
     }
 
+    /// The plan item a caller echoes to confirm this step: `<action> <target>`.
+    /// The action is part of it, so a step whose action changed between the
+    /// dry run and execute (enable became regenerate) is not confirmed.
+    pub fn item(&self) -> String {
+        format!("{} {}", self.action, self.target)
+    }
+
     fn to_change(&self) -> PlannedChange {
         let call = self.call.describe();
-        PlannedChange::new(self.target.clone(), self.action.clone()).with_detail(
-            match &self.detail {
-                Some(d) => format!("{d} ({call})"),
-                None => call,
-            },
-        )
+        PlannedChange::new(self.item(), self.action.clone()).with_detail(match &self.detail {
+            Some(d) => format!("{d} ({call})"),
+            None => call,
+        })
     }
 }
 
@@ -206,8 +211,8 @@ pub async fn run_with(
     Ok(out)
 }
 
-/// Keep only the steps the caller confirmed by echoing their targets from the
-/// dry run (`items`), in plan order. Returns the kept steps and a note for
+/// Keep only the steps the caller confirmed by echoing their items
+/// ([`Step::item`], the dry run's change targets), in plan order. Returns the kept steps and a note for
 /// each confirmed item that is no longer planned; those are never acted on.
 pub fn confirm(tool: &str, steps: Vec<Step>, items: &[String]) -> Result<(Vec<Step>, Vec<String>)> {
     if items.is_empty() && !steps.is_empty() {
@@ -217,12 +222,12 @@ pub fn confirm(tool: &str, steps: Vec<Step>, items: &[String]) -> Result<(Vec<St
     }
     let dropped = items
         .iter()
-        .filter(|i| !steps.iter().any(|s| &s.target == *i))
+        .filter(|i| !steps.iter().any(|s| s.item() == **i))
         .map(|i| format!("skipped {i}: no longer planned"))
         .collect();
     let kept = steps
         .into_iter()
-        .filter(|s| items.contains(&s.target))
+        .filter(|s| items.contains(&s.item()))
         .collect();
     Ok((kept, dropped))
 }
@@ -291,7 +296,7 @@ pub async fn plan_or_apply<A: Serialize>(
 /// A plan item for each step, for a caller to confirm on execute.
 #[cfg(test)]
 pub(crate) fn items(steps: &[Step]) -> Vec<String> {
-    steps.iter().map(|s| s.target.clone()).collect()
+    steps.iter().map(Step::item).collect()
 }
 
 #[cfg(test)]
@@ -434,10 +439,37 @@ mod tests {
     fn confirm_keeps_only_echoed_targets_and_reports_stale_ones() {
         assert!(confirm("t", steps(), &[]).is_err());
         assert!(confirm("t", Vec::new(), &[]).unwrap().0.is_empty());
-        let (kept, dropped) = confirm("t", steps(), &["b".into(), "gone".into()]).unwrap();
+        let (kept, dropped) = confirm("t", steps(), &["mint b".into(), "gone".into()]).unwrap();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].target, "b");
         assert_eq!(dropped, vec!["skipped gone: no longer planned"]);
+    }
+
+    #[test]
+    fn an_item_confirms_only_the_action_it_named() {
+        let planned = Step::new(
+            "token:h@pbs!backup",
+            "enable-token",
+            ApiCall::Put {
+                path: "/t".into(),
+                body: json!({}),
+            },
+        );
+        let confirmed = vec![planned.item()];
+        let now = Step::new(
+            "token:h@pbs!backup",
+            "regenerate-token",
+            ApiCall::Put {
+                path: "/t".into(),
+                body: json!({"regenerate": true}),
+            },
+        );
+        let (kept, dropped) = confirm("t", vec![now], &confirmed).unwrap();
+        assert!(kept.is_empty(), "enable must not authorize regenerate");
+        assert_eq!(
+            dropped,
+            vec!["skipped enable-token token:h@pbs!backup: no longer planned"]
+        );
     }
 
     #[tokio::test]

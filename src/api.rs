@@ -352,6 +352,61 @@ pub async fn task_log(c: &PbsClient, upid: &str, start: u64, limit: u64) -> Resu
     })
 }
 
+/// What a namespace subtree holds, so a destructive plan item can be bound to
+/// the contents the operator saw.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NsContents {
+    pub groups: u64,
+    pub snapshots: u64,
+    pub last_backup: i64,
+}
+
+impl NsContents {
+    /// `groups=<n>,snapshots=<n>@<last backup epoch>`.
+    pub fn fingerprint(&self) -> String {
+        format!(
+            "groups={},snapshots={}@{}",
+            self.groups, self.snapshots, self.last_backup
+        )
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde", rename_all = "kebab-case")]
+struct GroupCount {
+    #[serde(default)]
+    backup_count: u64,
+    #[serde(default)]
+    last_backup: i64,
+}
+
+/// Groups and snapshots in `ns` and every namespace below it. The groups
+/// endpoint lists one level, so each child namespace from `existing` is read
+/// too.
+pub async fn ns_contents(
+    c: &PbsClient,
+    store: &str,
+    existing: &[Namespace],
+    ns: &str,
+) -> Result<NsContents> {
+    let prefix = format!("{ns}/");
+    let mut out = NsContents::default();
+    for n in existing
+        .iter()
+        .filter(|n| n.ns == ns || n.ns.starts_with(&prefix))
+    {
+        let groups: Vec<GroupCount> = c
+            .get(&store_path(store, "/groups"), &[("ns", n.ns.clone())])
+            .await?;
+        for g in groups {
+            out.groups += 1;
+            out.snapshots += g.backup_count;
+            out.last_backup = out.last_backup.max(g.last_backup);
+        }
+    }
+    Ok(out)
+}
+
 /// Namespace paths that must be created, parent first, for `ns` to exist.
 pub fn missing_namespace_chain(existing: &[Namespace], ns: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -533,6 +588,26 @@ mod tests {
         let a = acls(&c).await.unwrap();
         assert_eq!(a.len(), 7);
         assert!(a.iter().all(|e| e.propagate));
+    }
+
+    #[tokio::test]
+    async fn ns_contents_sums_the_subtree() {
+        let m = MockTransport::new();
+        m.on(
+            Method::Get,
+            "/admin/datastore/main/groups",
+            200,
+            GROUPS_LIST,
+        );
+        let existing: Vec<Namespace> =
+            plugin_toolkit::serde_json::from_value(data(NAMESPACE_LIST)).unwrap();
+        let got = ns_contents(&m.client(), "main", &existing, "hosts")
+            .await
+            .unwrap();
+        assert_eq!(m.log().len(), 3, "hosts, hosts/freyr, hosts/baldur");
+        assert_eq!(got.groups, 9);
+        assert_eq!(got.snapshots, 108);
+        assert_eq!(got.fingerprint(), "groups=9,snapshots=108@1791000000");
     }
 
     #[test]
