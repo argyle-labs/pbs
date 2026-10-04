@@ -177,6 +177,66 @@ pub struct TaskFilter {
     pub limit: u64,
 }
 
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserToken {
+    /// Full auth id, `user@realm!name`.
+    pub tokenid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable: Option<bool>,
+    /// UNIX epoch; `0` or absent means never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+pub struct User {
+    pub userid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(default)]
+    pub tokens: Vec<UserToken>,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+pub struct AclEntry {
+    pub path: String,
+    /// User, token (`user@realm!name`) or group id.
+    pub ugid: String,
+    /// `user` (users and tokens) or `group`.
+    pub ugid_type: String,
+    pub roleid: String,
+    #[serde(default = "yes")]
+    pub propagate: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Active for `enable`/`expire` as PBS reports them: enabled unless `false`,
+/// never expiring when `expire` is 0 or absent.
+pub fn is_active(enable: Option<bool>, expire: Option<i64>, now: i64) -> bool {
+    enable != Some(false) && expire.is_none_or(|e| e == 0 || e > now)
+}
+
+pub async fn users(c: &PbsClient) -> Result<Vec<User>> {
+    c.get("/access/users", &[("include_tokens", "true".into())])
+        .await
+}
+
+pub async fn acls(c: &PbsClient) -> Result<Vec<AclEntry>> {
+    c.get("/access/acl", &[]).await
+}
+
 fn store_path(store: &str, rest: &str) -> String {
     format!("/admin/datastore/{}{rest}", encode(store))
 }
@@ -331,6 +391,10 @@ pub(crate) mod fixtures {
     pub const TASK_LIST: &str = include_str!("../tests/fixtures/task_list.json");
     pub const TASK_STATUS: &str = include_str!("../tests/fixtures/task_status.json");
     pub const TASK_LOG: &str = include_str!("../tests/fixtures/task_log.json");
+    pub const USERS_LIST: &str = include_str!("../tests/fixtures/users_list.json");
+    pub const ACL_LIST: &str = include_str!("../tests/fixtures/acl_list.json");
+    pub const TOKEN_CREATE: &str = include_str!("../tests/fixtures/token_create.json");
+    pub const TOKEN_REGENERATE: &str = include_str!("../tests/fixtures/token_regenerate.json");
 }
 
 #[cfg(test)]
@@ -433,6 +497,30 @@ mod tests {
             vec![(String::new(), "a".into()), ("a".into(), "b".into())]
         );
         assert!(missing_namespace_chain(&existing, "hosts/freyr").is_empty());
+    }
+
+    #[tokio::test]
+    async fn decodes_users_with_tokens_and_acls() {
+        let m = MockTransport::new();
+        m.on(Method::Get, "/access/users", 200, USERS_LIST);
+        m.on(Method::Get, "/access/acl", 200, ACL_LIST);
+        let c = m.client();
+        let us = users(&c).await.unwrap();
+        assert_eq!(us[1].tokens[0].tokenid, "freyr@pbs!backup");
+        assert!(us[2].tokens.is_empty());
+        assert_eq!(m.log()[0], "GET /access/users?include_tokens=true");
+        let a = acls(&c).await.unwrap();
+        assert_eq!(a.len(), 7);
+        assert!(a.iter().all(|e| e.propagate));
+    }
+
+    #[test]
+    fn activity_follows_enable_and_expiry() {
+        assert!(is_active(None, None, 100));
+        assert!(is_active(Some(true), Some(0), 100));
+        assert!(is_active(Some(true), Some(200), 100));
+        assert!(!is_active(Some(true), Some(50), 100));
+        assert!(!is_active(Some(false), None, 100));
     }
 
     #[test]

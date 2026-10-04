@@ -1,0 +1,1 @@
+{"data":[{"userid":"root@pam","enable":true,"expire":0,"tokens":[{"tokenid":"root@pam!orca","enable":true,"expire":0,"comment":"orca admin"}]},{"userid":"freyr@pbs","enable":true,"expire":0,"comment":"orca: backup client for freyr","tokens":[{"tokenid":"freyr@pbs!backup","enable":true,"expire":0}]},{"userid":"baldur@pbs","enable":true,"expire":0,"tokens":[]}]}

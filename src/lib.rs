@@ -9,6 +9,7 @@
 pub mod api;
 pub mod client;
 pub mod endpoint;
+pub mod enroll;
 pub mod plan;
 pub mod tls;
 pub mod tools;

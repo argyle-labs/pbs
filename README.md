@@ -73,6 +73,7 @@ See [proxmox-backup-restore.md](docs/proxmox-backup-restore.md) for worked opera
 - `pbs.datastore.list|detail` — datastores, usage, group/snapshot counts, GC state.
 - `pbs.namespace.list|create|delete`
 - `pbs.task.list|detail` — tasks and their logs, read through the API.
+- `pbs.host.enroll|revoke` — per backup client host: namespace `hosts/<host>`, user `<host>@pbs`, token `<host>@pbs!backup`, and `DatastoreBackup` + `DatastorePowerUser` on `/datastore/<ds>/hosts/<host>` only (PowerUser lets the host prune its own group). Enrol reports drift (missing pieces, out-of-scope ACLs, a token whose stored secret PBS now rejects) and fixes it on execute. The minted secret is stored as orca secret `pbs.<endpoint>.host_<host>_token` and is never printed. Revoke keeps the namespace and its backups unless `delete_data` is set.
 
 Every verb that changes PBS is a dry run unless called with `execute: true`, and executing needs an admin caller.
 
