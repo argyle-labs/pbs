@@ -74,6 +74,11 @@ See [proxmox-backup-restore.md](docs/proxmox-backup-restore.md) for worked opera
 - `pbs.namespace.list|create|delete`
 - `pbs.task.list|detail` — tasks and their logs, read through the API.
 - `pbs.host.enroll|revoke` — per backup client host: namespace `hosts/<host>`, user `<host>@pbs`, token `<host>@pbs!backup`, and `DatastoreBackup` + `DatastorePowerUser` on `/datastore/<ds>/hosts/<host>` only (PowerUser lets the host prune its own group). Enrol reports drift (missing pieces, out-of-scope ACLs, a token whose stored secret PBS now rejects) and fixes it on execute. The minted secret is stored as orca secret `pbs.<endpoint>.host_<host>_token` the moment PBS returns it and is never printed. If it can't be stored, enrol stops before any later step; re-running regenerates it. The names `admin`, `root` and `orca` are reserved, the user behind the endpoint's own token is refused, and an existing `<host>@pbs` user orca did not create is only taken over with `adopt: true`. Revoke keeps the namespace and its backups unless `delete_data` is set.
+- `pbs.sync_job.list|create|update|run`, `pbs.verify_job.list|create|update|run` — schedules are evaluated in the server's zone (UTC for the container image), so next and last runs are shown in both UTC and local time (`utc_offset` overrides the orca host's zone). `update` sends only the fields that differ.
+- `pbs.snapshot.list` — per-snapshot verify state. A snapshot whose verification failed is never used as an incremental base.
+- `pbs.gc.detail|run` — includes the pending removals: unreferenced chunks kept because they were touched within 24h 5min of the last GC start.
+- `pbs.group.list|delete` — across one or more datastores. Delete needs either named datastores or `all_datastores`.
+- `pbs.prune` — keeps the last 10 per group unless other `keep_*` options are given. The plan comes from PBS's own prune dry run.
 
 Every verb that changes PBS is a dry run unless called with `execute: true`, and executing needs an admin caller. `pbs.host.enroll`, `pbs.host.revoke` and `pbs.namespace.delete` also need `items`: the change targets from the dry run. Execute acts only on those that are still planned and reports the rest as skipped.
 

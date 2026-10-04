@@ -1,0 +1,1 @@
+{"data":[{"backup-type":"vm","backup-id":"111","backup-time":1790985600,"keep":true},{"backup-type":"vm","backup-id":"111","backup-time":1790899200,"keep":true},{"backup-type":"vm","backup-id":"111","backup-time":1790812800,"keep":false},{"backup-type":"vm","backup-id":"111","backup-time":1790726400,"keep":false,"protected":true}]}
