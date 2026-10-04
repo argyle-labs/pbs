@@ -316,8 +316,9 @@ async fn pbs_update(args: PbsUpdateArgs, _ctx: &ToolCtx) -> Result<PbsUpdateOutp
         )
     };
     // The secret goes first so a new token_id never sits beside the old
-    // token's secret. If the row write then fails, the endpoint holds the old
-    // token_id with the new secret and cannot authenticate; the old secret is
+    // token's secret. If the row write then fails while token_id changes, the
+    // endpoint holds the old token_id with the new secret and cannot
+    // authenticate; the old secret is
     // gone, so the fix is forward: re-run the same update, which works because
     // the staged copy is only deleted on success.
     if let Some(s) = &token_secret {
