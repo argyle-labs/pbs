@@ -395,6 +395,13 @@ pub(crate) mod fixtures {
     pub const ACL_LIST: &str = include_str!("../tests/fixtures/acl_list.json");
     pub const TOKEN_CREATE: &str = include_str!("../tests/fixtures/token_create.json");
     pub const TOKEN_REGENERATE: &str = include_str!("../tests/fixtures/token_regenerate.json");
+    pub const SYNC_LIST: &str = include_str!("../tests/fixtures/sync_list.json");
+    pub const VERIFY_LIST: &str = include_str!("../tests/fixtures/verify_list.json");
+    pub const GROUPS_LIST: &str = include_str!("../tests/fixtures/groups_list.json");
+    pub const SNAPSHOTS_LIST: &str = include_str!("../tests/fixtures/snapshots_list.json");
+    pub const PRUNE_DRY_RUN: &str = include_str!("../tests/fixtures/prune_dry_run.json");
+    pub const GROUP_DELETE: &str = include_str!("../tests/fixtures/group_delete.json");
+    pub const NODE_TIME: &str = include_str!("../tests/fixtures/node_time.json");
 }
 
 #[cfg(test)]
