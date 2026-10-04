@@ -67,11 +67,19 @@ See [proxmox-backup-restore.md](docs/proxmox-backup-restore.md) for worked opera
 
 ## With orca
 
-orca drives this plugin through its generic surface — rich, pbs-specific data comes back in the typed `service.status` payload, never bespoke tools.
+`service.*` deploys and backs up pbs itself. Managing a running server goes through the `pbs.*` verbs, which call the PBS REST API on `:8007` with an API token:
+
+- `pbs.create|update|delete|list|detail` — register an endpoint: routes, token id (`user@realm!tokenid`), and either a certificate fingerprint pin or an explicit `insecure`. The token secret and the pin are kept in orca's secrets domain (`pbs.<endpoint>.token_secret`, `pbs.<endpoint>.fingerprint`), never on the endpoint row.
+- `pbs.datastore.list|detail` — datastores, usage, group/snapshot counts, GC state.
+- `pbs.namespace.list|create|delete`
+- `pbs.task.list|detail` — tasks and their logs, read through the API.
+
+Every verb that changes PBS is a dry run unless called with `execute: true`, and executing needs an admin caller.
 
 ## Layout
 
-- `src/` — the plugin (pure Rust): the `ServiceBackend` descriptor + `configure` / `status`.
+- `src/` — the plugin (pure Rust): the `ServiceBackend` descriptor and the `pbs.*` API verbs.
+- `tests/fixtures/` — PBS API responses the unit tests decode.
 - `docs/` — standalone operator notes.
 - [CAPABILITIES.md](CAPABILITIES.md) — the service-backend contract checklist.
 - `assets/` — plugin icon.
