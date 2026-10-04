@@ -222,8 +222,6 @@ fn yes() -> bool {
     true
 }
 
-/// Active for `enable`/`expire` as PBS reports them: enabled unless `false`,
-/// never expiring when `expire` is 0 or absent.
 /// Mirrors PBS `User::is_active`: an expiry of 0 or below means never, and
 /// one equal to `now` has already expired.
 pub fn is_active(enable: Option<bool>, expire: Option<i64>, now: i64) -> bool {

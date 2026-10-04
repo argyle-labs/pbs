@@ -250,6 +250,7 @@ async fn namespace_delete(
     let (steps, notes) =
         namespace_delete_steps(&args.datastore, &existing, &args.ns, contents.as_ref());
     if args.execute {
+        plan::authorize_execute(TOOL, caller)?;
         plan::refuse_drifted(TOOL, &steps, &args.items)?;
     }
     let summary = format!(
@@ -588,7 +589,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("changed since the dry run"),
+            err.to_string()
+                .contains("changed or vanished since the dry run"),
             "{err}"
         );
         assert!(m.mutations().is_empty(), "{:?}", m.mutations());

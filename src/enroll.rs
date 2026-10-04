@@ -1402,6 +1402,30 @@ mod tests {
         assert!(acl_bodies[1..].iter().all(|b| b.get("digest").is_none()));
     }
 
+    /// Only content-bound (`#`) items refuse; any other stale item is skipped
+    /// and the rest of the confirmed plan runs.
+    #[test]
+    fn revoke_skips_a_stale_item_without_contents() {
+        let store = Rc::new(RefCell::new(Store::default()));
+        let m = revoke_mock();
+        let items = vec![
+            "revoke-DatastoreAdmin acl:freyr@pbs!backup:/datastore/main:DatastoreAdmin".to_string(),
+            "revoke-DatastoreAdmin acl:freyr@pbs!backup:/datastore/gone:DatastoreAdmin".to_string(),
+        ];
+        let out = run_revoke(&store, &m, items, true).unwrap();
+        assert_eq!(m.mutations(), vec!["PUT /access/acl"]);
+        let Change::Applied(a) = out.change else {
+            panic!()
+        };
+        assert!(
+            a.notes
+                .iter()
+                .any(|n| n.contains("/datastore/gone") && n.contains("no longer planned")),
+            "{:?}",
+            a.notes
+        );
+    }
+
     #[test]
     fn revoke_delete_data_binds_to_live_counts_and_refuses_growth() {
         let store = Rc::new(RefCell::new(Store::default()));
@@ -1438,7 +1462,8 @@ mod tests {
         );
         let err = run_revoke_with(&store, &m, items, true, true).unwrap_err();
         assert!(
-            err.to_string().contains("changed since the dry run"),
+            err.to_string()
+                .contains("changed or vanished since the dry run"),
             "{err}"
         );
         assert!(
