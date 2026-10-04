@@ -52,6 +52,36 @@ fn resolve_image(override_value: Option<String>) -> String {
         .unwrap_or_else(|| format!("{DEFAULT_IMAGE}:{IMAGE_TAG}"))
 }
 
+const CONFIG_DIR: &str = "/etc/proxmox-backup";
+
+/// Files under [`CONFIG_DIR`] a rebuilt server needs to come back with its
+/// datastores, users, tokens, ACLs and jobs. `token.shadow` holds the token
+/// secrets and `remote.cfg` the sync-remote credentials.
+pub const RESTORE_CRITICAL: &[&str] = &[
+    "datastore.cfg",
+    "user.cfg",
+    "shadow.json",
+    "token.cfg",
+    "token.shadow",
+    "acl.cfg",
+    "remote.cfg",
+    "sync.cfg",
+    "verification.cfg",
+    "prune.cfg",
+    "authkey.key",
+    "authkey.pub",
+    "csrf.key",
+    "proxy.key",
+    "proxy.pem",
+];
+
+/// Named volume holding [`CONFIG_DIR`]. For the instance `pbs` this is
+/// `pbs-config`, the volume the live container and the README's `docker run`
+/// use, so a redeploy reattaches the existing config instead of starting empty.
+pub fn config_volume(instance: &str) -> String {
+    format!("{instance}-config")
+}
+
 /// pbs backend. Holds only the provider name; per-instance endpoint/creds
 /// come from the instance id and `Routes` the generic `service.*` tools hand each op.
 #[derive(Debug, Clone)]
@@ -96,13 +126,13 @@ impl ServiceBackend for PbsBackend {
     /// Proxmox guests when available) snapshots these. No backup/restore code
     /// here; those are inherited from ServiceBackend's defaults.
     fn data_paths(&self) -> Vec<String> {
-        // PBS keeps its whole config surface — datastore.cfg, user.cfg, acl.cfg,
-        // plus `authkey.key` and `proxy.pem` — under one directory. Those keys
-        // ARE the server identity: restore them and existing clients keep their
-        // trust, lose them and every PVE host must re-verify a new fingerprint.
-        // Datastore *contents* are deliberately not listed: they are the backups
-        // themselves, mounted in from outside and never captured by this path.
-        vec!["/etc/proxmox-backup".to_string()]
+        // PBS keeps its whole config surface (see `RESTORE_CRITICAL`) under one
+        // directory. `authkey.key` and `proxy.pem` ARE the server identity:
+        // restore them and existing clients keep their trust, lose them and
+        // every PVE host must re-verify a new fingerprint. Datastore *contents*
+        // are deliberately not listed: they are the backups themselves, mounted
+        // in from outside and never captured by this path.
+        vec![CONFIG_DIR.to_string()]
     }
 
     fn workload_spec<'a>(
@@ -120,8 +150,12 @@ impl ServiceBackend for PbsBackend {
                     mounts: vec![
                         // Config + server identity. Named volume rather than a
                         // host path so recreating the container is lossless.
-                        Mount::bind(format!("{instance}-config"), "/etc/proxmox-backup"),
+                        Mount::bind(config_volume(instance), CONFIG_DIR),
                         Mount::bind(format!("{instance}-logs"), "/var/log/proxmox-backup"),
+                        // PBS keeps its config-version cache in shared memory
+                        // here and requires tmpfs; on a plain directory the
+                        // server still serves but traffic control never loads.
+                        Mount::tmpfs("/run/proxmox-backup"),
                     ],
                     // Datastore mounts are deliberately absent: which paths hold
                     // backups is per-install, so they are supplied as endpoint
@@ -196,6 +230,54 @@ mod tests {
             .expect("config mount");
         assert_eq!(cfg.source, "pbs-willow-config");
         assert!(!cfg.read_only);
+    }
+
+    #[tokio::test]
+    async fn instance_pbs_reattaches_the_live_volumes() {
+        let spec = PbsBackend::new("pbs")
+            .workload_spec(Runtime::Docker, "pbs", &Routes::new())
+            .await
+            .unwrap();
+        let source = |target: &str| {
+            spec.mounts
+                .iter()
+                .find(|m| m.target == target)
+                .map(|m| m.source.clone())
+        };
+        assert_eq!(source("/etc/proxmox-backup").as_deref(), Some("pbs-config"));
+        assert_eq!(
+            source("/var/log/proxmox-backup").as_deref(),
+            Some("pbs-logs")
+        );
+    }
+
+    #[tokio::test]
+    async fn docker_spec_mounts_run_dir_as_tmpfs() {
+        let spec = PbsBackend::new("pbs")
+            .workload_spec(Runtime::Docker, "pbs", &Routes::new())
+            .await
+            .unwrap();
+        let run = spec
+            .mounts
+            .iter()
+            .find(|m| m.target == "/run/proxmox-backup")
+            .expect("tmpfs mount");
+        assert_eq!(run.kind, plugin_toolkit::deploy_target::MountKind::Tmpfs);
+        assert!(spec.mounts.iter().all(|m| m.validation_error().is_none()));
+    }
+
+    #[test]
+    fn backup_covers_every_restore_critical_file() {
+        let paths = PbsBackend::new("pbs").data_paths();
+        for f in RESTORE_CRITICAL {
+            let full = format!("{CONFIG_DIR}/{f}");
+            assert!(
+                paths.iter().any(|p| full.starts_with(&format!("{p}/"))),
+                "{full} is not under any data path"
+            );
+        }
+        let spec = PbsBackend::new("pbs").backup_spec();
+        assert_eq!(spec.include, vec![CONFIG_DIR.to_string()]);
     }
 
     #[test]

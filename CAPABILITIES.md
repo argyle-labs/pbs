@@ -5,7 +5,7 @@ generic `service.*` surface — no per-plugin tools. Runtimes: **docker,podman,l
 
 ## Per-plugin code (the only work this repo owns)
 - [x] `provider` / `runtimes` / `default_port` / `capabilities` / `data_paths` — declarative descriptor
-- [x] `workload_spec(runtime)` — docker/podman implemented (image + config/log volumes + published port); lxc/vm still unimplemented
+- [x] `workload_spec(runtime)` — docker/podman implemented (image, `<instance>-config`/`<instance>-logs` volumes, `/run/proxmox-backup` tmpfs, published port); lxc/vm still unimplemented
 - [ ] `configure` — apply pbs config via its upstream API
 - [ ] `status` — health + rich diagnostics returned in the typed `ServiceStatus.info`
 
