@@ -116,10 +116,13 @@ pub struct PbsCreateArgs {
     #[arg(long)]
     #[serde(alias = "token_id")]
     pub token_id: String,
-    /// API token secret. Stored in the secrets domain, never on the row.
+    /// Name of an orca secret holding the API token secret, written first
+    /// with `orca secrets upsert --name <ref> --value-stdin` so the value
+    /// never appears on a command line. It is copied to
+    /// `pbs.<name>.token_secret`.
     #[arg(long)]
-    #[serde(alias = "token_secret")]
-    pub token_secret: String,
+    #[serde(alias = "token_secret_ref")]
+    pub token_secret_ref: String,
     /// SHA-256 fingerprint of the PBS certificate (`AA:BB:…`). Pins TLS to
     /// that certificate; the usual choice for PBS's self-signed cert.
     #[arg(long)]
@@ -144,6 +147,21 @@ pub struct PbsCreateOutput {
     pub fingerprint_pinned: bool,
 }
 
+/// The value behind a caller-supplied secret reference.
+fn resolve_ref(reference: &str) -> Result<String> {
+    if reference.trim().is_empty() {
+        bail!("token_secret_ref must name an orca secret");
+    }
+    secrets::get(reference)?
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "no orca secret named '{reference}'; write it first with \
+                 `orca secrets upsert --name {reference} --value-stdin`"
+            )
+        })
+}
+
 fn store_secrets(name: &str, token_secret: Option<&str>, fp: Option<&Fingerprint>) -> Result<()> {
     if let Some(s) = token_secret {
         secrets::set(
@@ -164,14 +182,13 @@ fn store_secrets(name: &str, token_secret: Option<&str>, fp: Option<&Fingerprint
     Ok(())
 }
 
-/// Register a PBS endpoint. The token secret goes to the secrets domain.
+/// Register a PBS endpoint. The token secret is read from an orca secret
+/// reference and kept in the secrets domain, never on the row.
 #[orca_tool(domain = "pbs", verb = "create")]
 async fn pbs_create(args: PbsCreateArgs, _ctx: &ToolCtx) -> Result<PbsCreateOutput> {
     validate_name(&args.name)?;
     validate_token_id(&args.token_id)?;
-    if args.token_secret.trim().is_empty() {
-        bail!("token_secret must not be empty");
-    }
+    let token_secret = resolve_ref(&args.token_secret_ref)?;
     let fp = args
         .fingerprint
         .as_deref()
@@ -185,7 +202,7 @@ async fn pbs_create(args: PbsCreateArgs, _ctx: &ToolCtx) -> Result<PbsCreateOutp
         enabled: true,
     };
     endpoint_db::insert(&row).map_err(|e| runtime::map_insert_conflict(e, PROVIDER, &row.name))?;
-    if let Err(e) = store_secrets(&row.name, Some(&args.token_secret), fp.as_ref()) {
+    if let Err(e) = store_secrets(&row.name, Some(&token_secret), fp.as_ref()) {
         if let Err(rollback) = endpoint_db::remove(&row.name) {
             tracing::warn!(endpoint = %row.name, error = %rollback, "rollback of endpoint row failed");
         }
@@ -205,10 +222,11 @@ pub struct PbsUpdateArgs {
     #[arg(long)]
     #[serde(default, alias = "token_id")]
     pub token_id: Option<String>,
-    /// Replace the stored token secret.
+    /// Replace the stored token secret with the value of this orca secret
+    /// (see `pbs.create`).
     #[arg(long)]
-    #[serde(default, alias = "token_secret")]
-    pub token_secret: Option<String>,
+    #[serde(default, alias = "token_secret_ref")]
+    pub token_secret_ref: Option<String>,
     /// Replace the TLS pin. An empty string removes it.
     #[arg(long)]
     #[serde(default)]
@@ -226,23 +244,28 @@ pub struct PbsUpdateArgs {
 }
 
 #[orca_struct]
+#[derive(Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct PbsUpdateOutput {
     pub endpoint: EndpointEntry,
     pub applied: Vec<String>,
 }
 
-/// Patch a PBS endpoint. Secrets are written to the secrets domain.
+/// Patch a PBS endpoint. Secrets are written to the secrets domain only after
+/// the row update succeeds.
 #[orca_tool(domain = "pbs", verb = "update")]
 async fn pbs_update(args: PbsUpdateArgs, _ctx: &ToolCtx) -> Result<PbsUpdateOutput> {
     validate_name(&args.name)?;
-    if args
-        .token_secret
+    let token_secret = args
+        .token_secret_ref
         .as_deref()
-        .is_some_and(|s| s.trim().is_empty())
-    {
-        bail!("token_secret must not be empty");
-    }
+        .map(resolve_ref)
+        .transpose()?;
+    let fp_change = match args.fingerprint.as_deref().map(str::trim) {
+        Some("") => Some(None),
+        Some(s) => Some(Some(Fingerprint::parse(s)?)),
+        None => None,
+    };
     let mut row = endpoint_db::get(&args.name)?
         .ok_or_else(|| runtime::missing_row_error(PROVIDER, &args.name))?;
     let mut applied = Vec::new();
@@ -263,36 +286,29 @@ async fn pbs_update(args: PbsUpdateArgs, _ctx: &ToolCtx) -> Result<PbsUpdateOutp
         row.enabled = v;
         applied.push("enabled".to_string());
     }
-    let fp = match args.fingerprint.as_deref().map(str::trim) {
-        Some("") => {
-            secrets::delete(&secret_name(&row.name, FINGERPRINT_FIELD))?;
-            applied.push("fingerprint".to_string());
-            None
-        }
-        Some(s) => Some(Fingerprint::parse(s)?),
-        None => None,
-    };
-    if applied.is_empty() && args.token_secret.is_none() && fp.is_none() {
+    if applied.is_empty() && token_secret.is_none() && fp_change.is_none() {
         bail!("no fields to update; pass at least one flag");
     }
-    if !row_fields_unchanged(&applied) && !endpoint_db::update(&row)? {
+    if !applied.is_empty() && !endpoint_db::update(&row)? {
         bail!("update reported no row change for `{}`", row.name);
     }
-    store_secrets(&row.name, args.token_secret.as_deref(), fp.as_ref())?;
-    if args.token_secret.is_some() {
-        applied.push("token_secret".to_string());
-    }
-    if fp.is_some() {
+    if let Some(fp) = &fp_change {
+        match fp {
+            Some(fp) => store_secrets(&row.name, None, Some(fp))?,
+            None => {
+                secrets::delete(&secret_name(&row.name, FINGERPRINT_FIELD))?;
+            }
+        }
         applied.push("fingerprint".to_string());
+    }
+    if let Some(s) = &token_secret {
+        store_secrets(&row.name, Some(s), None)?;
+        applied.push("token_secret".to_string());
     }
     Ok(PbsUpdateOutput {
         endpoint: entry(&row),
         applied,
     })
-}
-
-fn row_fields_unchanged(applied: &[String]) -> bool {
-    applied.iter().all(|f| f == "fingerprint")
 }
 
 #[orca_struct(args)]
@@ -450,11 +466,22 @@ mod tests {
 
     const FP: &str = "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
 
+    /// A store with the staged secrets the create/update args reference.
+    fn staged(mut store: Store) -> Rc<RefCell<Store>> {
+        store
+            .secrets
+            .insert("staged.pbs".into(), "tok-secret-1".into());
+        store
+            .secrets
+            .insert("staged.pbs.2".into(), "tok-secret-2".into());
+        Rc::new(RefCell::new(store))
+    }
+
     fn create_args(name: &str) -> PbsCreateArgs {
         PbsCreateArgs {
             name: name.into(),
             token_id: "root@pam!orca".into(),
-            token_secret: "tok-secret-1".into(),
+            token_secret_ref: "staged.pbs".into(),
             fingerprint: Some(FP.to_lowercase()),
             insecure: false,
             routes: vec![route::parse_route("lan_v4=https://10.0.0.5:8007").unwrap()],
@@ -463,7 +490,7 @@ mod tests {
 
     #[test]
     fn create_keeps_secret_and_pin_off_the_row() {
-        let store = Rc::new(RefCell::new(Store::default()));
+        let store = staged(Store::default());
         let out = with_store(&store, || {
             rt().block_on(pbs_create(create_args("willow"), &ctx()))
                 .unwrap()
@@ -491,10 +518,10 @@ mod tests {
 
     #[test]
     fn create_rolls_back_row_when_secret_store_fails() {
-        let store = Rc::new(RefCell::new(Store {
+        let store = staged(Store {
             fail_secret_set: true,
             ..Default::default()
-        }));
+        });
         let err = with_store(&store, || {
             rt().block_on(pbs_create(create_args("willow"), &ctx()))
                 .unwrap_err()
@@ -505,7 +532,7 @@ mod tests {
 
     #[test]
     fn create_rejects_bad_inputs() {
-        let store = Rc::new(RefCell::new(Store::default()));
+        let store = staged(Store::default());
         with_store(&store, || {
             let rt = rt();
             let mut a = create_args("bad.name");
@@ -522,7 +549,7 @@ mod tests {
 
     #[test]
     fn update_can_clear_pin_and_rotate_secret() {
-        let store = Rc::new(RefCell::new(Store::default()));
+        let store = staged(Store::default());
         let out = with_store(&store, || {
             let rt = rt();
             rt.block_on(pbs_create(create_args("willow"), &ctx()))
@@ -530,7 +557,7 @@ mod tests {
             rt.block_on(pbs_update(
                 PbsUpdateArgs {
                     name: "willow".into(),
-                    token_secret: Some("tok-secret-2".into()),
+                    token_secret_ref: Some("staged.pbs.2".into()),
                     fingerprint: Some(String::new()),
                     ..Default::default()
                 },
@@ -546,7 +573,7 @@ mod tests {
 
     #[test]
     fn delete_removes_row_and_secrets() {
-        let store = Rc::new(RefCell::new(Store::default()));
+        let store = staged(Store::default());
         let out = with_store(&store, || {
             let rt = rt();
             rt.block_on(pbs_create(create_args("willow"), &ctx()))
@@ -561,12 +588,49 @@ mod tests {
         });
         assert!(out.changed);
         assert_eq!(out.secrets_removed, vec!["token_secret", "fingerprint"]);
-        assert!(store.borrow().secrets.is_empty());
+        assert!(!store
+            .borrow()
+            .secrets
+            .keys()
+            .any(|k| k.starts_with("pbs.willow.")));
+    }
+
+    #[test]
+    fn a_missing_secret_reference_is_refused_before_any_write() {
+        let store = staged(Store::default());
+        let mut a = create_args("willow");
+        a.token_secret_ref = "never.written".into();
+        let err = with_store(&store, || rt().block_on(pbs_create(a, &ctx())).unwrap_err());
+        assert!(err.to_string().contains("--value-stdin"), "{err}");
+        assert!(store.borrow().rows.is_empty());
+    }
+
+    #[test]
+    fn update_with_a_bad_pin_changes_nothing() {
+        let store = staged(Store::default());
+        let err = with_store(&store, || {
+            let rt = rt();
+            rt.block_on(pbs_create(create_args("willow"), &ctx()))
+                .unwrap();
+            rt.block_on(pbs_update(
+                PbsUpdateArgs {
+                    name: "willow".into(),
+                    insecure: Some(true),
+                    fingerprint: Some("nope".into()),
+                    ..Default::default()
+                },
+                &ctx(),
+            ))
+            .unwrap_err()
+        });
+        assert!(err.to_string().contains("fingerprint"), "{err}");
+        let row = with_store(&store, || select(Some("willow")).unwrap());
+        assert!(!row.insecure);
     }
 
     #[test]
     fn select_needs_a_name_when_several_exist() {
-        let store = Rc::new(RefCell::new(Store::default()));
+        let store = staged(Store::default());
         with_store(&store, || {
             let rt = rt();
             rt.block_on(pbs_create(create_args("a"), &ctx())).unwrap();

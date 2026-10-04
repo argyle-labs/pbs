@@ -157,6 +157,18 @@ pub fn plan<A: Serialize>(
 /// Run `steps` in order and return each raw PBS response. A failure names the
 /// step and what already ran: a partial apply must never read as success.
 pub async fn run(tool: &str, c: &PbsClient, steps: &[Step]) -> Result<Vec<Value>> {
+    run_with(tool, c, steps, |_, _| Ok(())).await
+}
+
+/// [`run`], calling `after` on each step's response before the next step
+/// starts, so a result that must be persisted (a minted secret) is never held
+/// across later calls that could fail.
+pub async fn run_with(
+    tool: &str,
+    c: &PbsClient,
+    steps: &[Step],
+    mut after: impl FnMut(&Step, &Value) -> Result<()>,
+) -> Result<Vec<Value>> {
     let mut out = Vec::with_capacity(steps.len());
     for (i, s) in steps.iter().enumerate() {
         let res: Result<Value> = match &s.call {
@@ -168,25 +180,51 @@ pub async fn run(tool: &str, c: &PbsClient, steps: &[Step]) -> Result<Vec<Value>
                 c.delete(path, &q).await
             }
         };
-        match res {
+        let done = |upto: usize| -> String {
+            steps[..upto]
+                .iter()
+                .map(|s| format!("{} {}", s.action, s.target))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match res.and_then(|v| {
+            after(s, &v)
+                .map(|()| v)
+                .map_err(|e| e.context("after the call succeeded"))
+        }) {
             Ok(v) => out.push(v),
-            Err(e) => {
-                let done: Vec<String> = steps[..i]
-                    .iter()
-                    .map(|s| format!("{} {}", s.action, s.target))
-                    .collect();
-                bail!(
-                    "{tool}: step {} of {} ({} {}) failed: {e:#}; already applied: [{}]",
-                    i + 1,
-                    steps.len(),
-                    s.action,
-                    s.target,
-                    done.join(", ")
-                );
-            }
+            Err(e) => bail!(
+                "{tool}: step {} of {} ({} {}) failed: {e:#}; already applied: [{}]",
+                i + 1,
+                steps.len(),
+                s.action,
+                s.target,
+                done(i)
+            ),
         }
     }
     Ok(out)
+}
+
+/// Keep only the steps the caller confirmed by echoing their targets from the
+/// dry run (`items`), in plan order. Returns the kept steps and a note for
+/// each confirmed item that is no longer planned; those are never acted on.
+pub fn confirm(tool: &str, steps: Vec<Step>, items: &[String]) -> Result<(Vec<Step>, Vec<String>)> {
+    if items.is_empty() && !steps.is_empty() {
+        bail!(
+            "{tool}: execute needs the items from the dry run; re-run without execute and pass its change targets as items"
+        );
+    }
+    let dropped = items
+        .iter()
+        .filter(|i| !steps.iter().any(|s| &s.target == *i))
+        .map(|i| format!("skipped {i}: no longer planned"))
+        .collect();
+    let kept = steps
+        .into_iter()
+        .filter(|s| items.contains(&s.target))
+        .collect();
+    Ok((kept, dropped))
 }
 
 pub fn applied(
@@ -218,6 +256,8 @@ pub fn applied(
 }
 
 /// The common shape: plan unless `execute`, else authorize, run, report.
+/// With `confirmed`, execute acts only on the plan items the caller echoed
+/// back (see [`confirm`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn plan_or_apply<A: Serialize>(
     tool: &str,
@@ -227,16 +267,31 @@ pub async fn plan_or_apply<A: Serialize>(
     c: &PbsClient,
     summary: String,
     steps: Vec<Step>,
-    notes: Vec<String>,
+    mut notes: Vec<String>,
+    confirmed: Option<&[String]>,
 ) -> Result<Change> {
     if !execute {
         return Ok(Change::Plan(plan(tool, args, summary, &steps, &notes)?));
     }
     authorize_execute(tool, caller)?;
+    let steps = match confirmed {
+        Some(items) => {
+            let (kept, dropped) = confirm(tool, steps, items)?;
+            notes.extend(dropped);
+            kept
+        }
+        None => steps,
+    };
     let results = run(tool, c, &steps).await?;
     Ok(Change::Applied(applied(
         tool, summary, &steps, &results, notes,
     )))
+}
+
+/// A plan item for each step, for a caller to confirm on execute.
+#[cfg(test)]
+pub(crate) fn items(steps: &[Step]) -> Vec<String> {
+    steps.iter().map(|s| s.target.clone()).collect()
 }
 
 #[cfg(test)]
@@ -301,6 +356,7 @@ mod tests {
             "s".into(),
             steps(),
             vec![],
+            None,
         )
         .await
         .unwrap();
@@ -327,6 +383,7 @@ mod tests {
             "s".into(),
             steps(),
             vec![],
+            None,
         )
         .await
         .unwrap();
@@ -350,5 +407,56 @@ mod tests {
             .to_string();
         assert!(err.contains("step 2 of 2 (mint b)"), "{err}");
         assert!(err.contains("already applied: [create a]"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn after_hook_failure_stops_before_the_next_step() {
+        let m = MockTransport::new();
+        m.ok(Method::Post, "/one", json!(null));
+        m.ok(Method::Post, "/two", json!(null));
+        let err = run_with("pbs.t", &m.client(), &steps(), |s, _| {
+            if s.target == "a" {
+                bail!("store failed")
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("step 1 of 2") && err.contains("store failed"),
+            "{err}"
+        );
+        assert_eq!(m.mutations(), vec!["POST /one"]);
+    }
+
+    #[test]
+    fn confirm_keeps_only_echoed_targets_and_reports_stale_ones() {
+        assert!(confirm("t", steps(), &[]).is_err());
+        assert!(confirm("t", Vec::new(), &[]).unwrap().0.is_empty());
+        let (kept, dropped) = confirm("t", steps(), &["b".into(), "gone".into()]).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].target, "b");
+        assert_eq!(dropped, vec!["skipped gone: no longer planned"]);
+    }
+
+    #[tokio::test]
+    async fn execute_without_items_is_refused_when_confirmation_is_required() {
+        let m = MockTransport::new();
+        let err = plan_or_apply(
+            "pbs.t",
+            &json!({}),
+            true,
+            Some(&admin()),
+            &m.client(),
+            "s".into(),
+            steps(),
+            vec![],
+            Some(&[]),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("needs the items"), "{err}");
+        assert!(m.log().is_empty());
     }
 }
