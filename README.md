@@ -61,7 +61,11 @@ Note this only governs **new** writes. An existing datastore written under a dif
 
 The `--tmpfs /run/proxmox-backup` is **required**, not optional: PBS keeps its config-version cache in shared memory there and needs that path on tmpfs. Without it the server still starts and serves, but traffic control silently fails to load (`path "/run/proxmox-backup/shmem" is not on tmpfs`). The entrypoint warns when it is missing.
 
+When orca deploys the workload it mounts this tmpfs at 16m, but it cannot yet set `mode` or `nosuid,nodev`: orca's deploy `Mount` has no field for tmpfs options. Until it does, the mount uses the runtime's defaults.
+
 Datastore contents are mounted in from outside and are never part of the image or the config volume.
+
+**The config backup is secret-grade.** orca's self-config backup of this plugin's workload covers `/etc/proxmox-backup` and `/var/lib/proxmox-backup`, which include `token.shadow` (API token secret hashes), `authkey.key` (the ticket signing key), `tfa.json` and the tape encryption keys. Anyone who can read that backup can mint PBS tickets, so store it only on a destination you would trust with the server itself.
 
 
 See [proxmox-backup-restore.md](docs/proxmox-backup-restore.md) for worked operator notes.
@@ -78,8 +82,8 @@ See [proxmox-backup-restore.md](docs/proxmox-backup-restore.md) for worked opera
 - `pbs.sync_job.list|create|update|run`, `pbs.verify_job.list|create|update|run` — schedules are evaluated in the server's zone (UTC for the container image), so next and last runs are shown in UTC and in the server's zone, plus at `utc_offset` (e.g. `-06:00`) when given. There is no automatic host-local time: the plugin can run on any orca host and orca's time primitives expose no local zone. `update` sends only the fields that differ and echoes the job's config digest.
 - `pbs.snapshot.list` — per-snapshot verify state. A snapshot whose verification failed is never used as an incremental base.
 - `pbs.gc.detail|run` — includes the pending removals: unreferenced chunks kept because they were touched within 24h 5min of the last GC start.
-- `pbs.group.list|delete` — across one or more datastores. Delete needs either named datastores or `all_datastores` (which also deletes replicas on sync targets), and refuses if a confirmed group's snapshot count or last backup changed since the dry run.
-- `pbs.prune` — keeps the last 10 per group unless other `keep_*` options are given. Needs `backup_type` or an explicit `all_groups`. The plan comes from PBS's own prune dry run.
+- `pbs.group.list|delete` — across one or more datastores. Delete needs either named datastores or `all_datastores` (which also deletes replicas on sync targets), and refuses if a confirmed group's snapshot count or last backup changed since the dry run. That check is a fresh read just before the DELETE; PBS has no conditional delete, so a backup that finishes in the few milliseconds between them is removed with the group.
+- `pbs.prune` — keeps the last 10 per group unless other `keep_*` options are given. Needs `backup_type` or an explicit `all_groups`. The plan comes from PBS's own prune dry run; PBS re-applies the keep rules at execute, so a snapshot taken after the dry run can shift which ones go.
 
 Every verb that changes PBS is a dry run unless called with `execute: true`, and executing needs an admin caller. `pbs.host.enroll`, `pbs.host.revoke`, `pbs.namespace.delete`, `pbs.group.delete` and `pbs.prune` also need `items`: the change targets from the dry run. Each item is `<action> <target>`, so a step whose action changed since the dry run (an `enable-token` that became `regenerate-token`) is not confirmed; destructive items also carry what they delete (snapshot counts and last backup), so new backups void the confirmation. Execute acts only on items still planned and reports the rest as skipped.
 
