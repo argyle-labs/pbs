@@ -234,8 +234,13 @@ pub async fn pbs_namespace_delete(args: NamespaceDeleteArgs, ctx: &ToolCtx) -> R
     api::validate_ns(&args.ns)?;
     let c = endpoint::connect(args.endpoint.as_deref()).await?;
     let existing = api::namespaces(&c, &args.datastore).await?;
+    let contents = if args.delete_groups {
+        Some(api::ns_contents(&c, &args.datastore, &existing, &args.ns).await?)
+    } else {
+        None
+    };
     let (steps, notes) =
-        namespace_delete_steps(&args.datastore, &existing, &args.ns, args.delete_groups);
+        namespace_delete_steps(&args.datastore, &existing, &args.ns, contents.as_ref());
     let summary = format!(
         "delete namespace {} on datastore {}",
         args.ns, args.datastore
@@ -254,17 +259,25 @@ pub async fn pbs_namespace_delete(args: NamespaceDeleteArgs, ctx: &ToolCtx) -> R
     .await
 }
 
+/// `contents` is set when the delete takes the backups with it. Its
+/// fingerprint goes into the plan item, so a namespace that gained or lost
+/// backups after the dry run is no longer confirmed.
 pub fn namespace_delete_steps(
     store: &str,
     existing: &[Namespace],
     ns: &str,
-    delete_groups: bool,
+    contents: Option<&api::NsContents>,
 ) -> (Vec<Step>, Vec<String>) {
     if !existing.iter().any(|n| n.ns == ns) {
         return (Vec::new(), vec![format!("namespace {ns} does not exist")]);
     }
+    let delete_groups = contents.is_some();
+    let target = match contents {
+        Some(c) => format!("{store}:{ns}#{}", c.fingerprint()),
+        None => format!("{store}:{ns}"),
+    };
     let step = Step::new(
-        format!("{store}:{ns}"),
+        target,
         "delete-namespace",
         ApiCall::Delete {
             path: format!(
@@ -277,10 +290,12 @@ pub fn namespace_delete_steps(
             ],
         },
     )
-    .detail(if delete_groups {
-        "removes every backup group in and below it"
-    } else {
-        "fails if any backup group remains"
+    .detail(match contents {
+        Some(c) => format!(
+            "removes {} groups ({} snapshots) in and below it",
+            c.groups, c.snapshots
+        ),
+        None => "fails if any backup group remains".to_string(),
     });
     (vec![step], Vec::new())
 }
@@ -422,10 +437,27 @@ mod tests {
 
     #[test]
     fn namespace_delete_is_a_noop_when_absent() {
-        let (steps, notes) = namespace_delete_steps("main", &existing(), "hosts/gone", false);
+        let (steps, notes) = namespace_delete_steps("main", &existing(), "hosts/gone", None);
         assert!(steps.is_empty());
         assert!(notes[0].contains("does not exist"));
-        let (steps, _) = namespace_delete_steps("main", &existing(), "hosts/freyr", true);
+        let contents = api::NsContents {
+            groups: 1,
+            snapshots: 14,
+            last_backup: 1_791_000_000,
+        };
+        let (steps, _) =
+            namespace_delete_steps("main", &existing(), "hosts/freyr", Some(&contents));
+        assert_eq!(
+            steps[0].target,
+            "main:hosts/freyr#groups=1,snapshots=14@1791000000"
+        );
+        let grown = api::NsContents {
+            snapshots: 15,
+            ..contents
+        };
+        let (now, _) = namespace_delete_steps("main", &existing(), "hosts/freyr", Some(&grown));
+        let (kept, _) = plan::confirm("t", now, &[steps[0].item()]).unwrap();
+        assert!(kept.is_empty(), "new backups must void the confirmation");
         assert_eq!(
             steps[0].call,
             ApiCall::Delete {
