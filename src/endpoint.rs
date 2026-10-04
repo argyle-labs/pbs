@@ -148,15 +148,13 @@ pub struct PbsCreateOutput {
 }
 
 /// The value behind a caller-supplied secret reference.
-/// Only `pbs.<name>.staged` is accepted: the staged secret is deleted after
-/// the copy, so any other name could make this verb read or destroy a secret
-/// that belongs to something else.
-fn resolve_ref(reference: &str) -> Result<String> {
-    let middle = reference
-        .strip_prefix("pbs.")
-        .and_then(|r| r.strip_suffix(".staged"));
-    if middle.is_none_or(|m| validate_name(m).is_err()) {
-        bail!("token_secret_ref must be an orca secret named pbs.<name>.staged, got '{reference}'");
+/// Only `pbs.<endpoint>.staged` for this endpoint is accepted: the staged
+/// secret is deleted after the copy, so any other name could make this verb
+/// read or destroy a secret that belongs to something else. The rejected
+/// reference is not echoed, since a caller may have pasted the value itself.
+fn resolve_ref(reference: &str, endpoint: &str) -> Result<String> {
+    if reference != format!("pbs.{endpoint}.staged") {
+        bail!("token_secret_ref must be the orca secret pbs.{endpoint}.staged");
     }
     secrets::get(reference)?
         .filter(|v| !v.trim().is_empty())
@@ -202,7 +200,7 @@ fn store_secrets(name: &str, token_secret: Option<&str>, fp: Option<&Fingerprint
 async fn pbs_create(args: PbsCreateArgs, _ctx: &ToolCtx) -> Result<PbsCreateOutput> {
     validate_name(&args.name)?;
     validate_token_id(&args.token_id)?;
-    let token_secret = resolve_ref(&args.token_secret_ref)?;
+    let token_secret = resolve_ref(&args.token_secret_ref, &args.name)?;
     let fp = args
         .fingerprint
         .as_deref()
@@ -274,7 +272,7 @@ async fn pbs_update(args: PbsUpdateArgs, _ctx: &ToolCtx) -> Result<PbsUpdateOutp
     let token_secret = args
         .token_secret_ref
         .as_deref()
-        .map(resolve_ref)
+        .map(|r| resolve_ref(r, &args.name))
         .transpose()?;
     let fp_change = match args.fingerprint.as_deref().map(str::trim) {
         Some("") => Some(None),
@@ -317,12 +315,23 @@ async fn pbs_update(args: PbsUpdateArgs, _ctx: &ToolCtx) -> Result<PbsUpdateOutp
             applied.join(", ")
         )
     };
-    // The row is the first write, so its failure has nothing to report.
+    // The secret goes first: a row naming a new token_id beside the old
+    // token's secret would authenticate as nothing.
+    if let Some(s) = &token_secret {
+        store_secrets(&row.name, Some(s), None)?;
+        applied.push("token_secret".to_string());
+    }
     if !row_fields.is_empty() {
-        if !endpoint_db::update(&row)? {
-            bail!("update reported no row change for `{}`", row.name);
+        match endpoint_db::update(&row) {
+            Ok(true) => applied.extend(row_fields.iter().map(|f| f.to_string())),
+            Ok(false) => {
+                return Err(fail(
+                    &applied,
+                    anyhow!("update reported no row change for `{}`", row.name),
+                ))
+            }
+            Err(e) => return Err(fail(&applied, e)),
         }
-        applied.extend(row_fields.iter().map(|f| f.to_string()));
     }
     if let Some(fp) = &fp_change {
         let res = match fp {
@@ -331,10 +340,6 @@ async fn pbs_update(args: PbsUpdateArgs, _ctx: &ToolCtx) -> Result<PbsUpdateOutp
         };
         res.map_err(|e| fail(&applied, e))?;
         applied.push("fingerprint".to_string());
-    }
-    if let Some(s) = &token_secret {
-        store_secrets(&row.name, Some(s), None).map_err(|e| fail(&applied, e))?;
-        applied.push("token_secret".to_string());
     }
     if let Some(r) = &args.token_secret_ref {
         drop_staged(r);
@@ -400,6 +405,7 @@ pub(crate) mod test_store {
         pub rows: Vec<DbRow>,
         pub secrets: HashMap<String, String>,
         pub fail_secret_set: bool,
+        pub fail_db_update: bool,
     }
 
     fn handle(store: &mut Store, cap: &str, json: &str) -> std::result::Result<String, String> {
@@ -412,6 +418,9 @@ pub(crate) mod test_store {
                     DbOp::Insert { row, .. } => {
                         store.rows.push(row);
                         reply.affected = 1;
+                    }
+                    DbOp::Update { .. } if store.fail_db_update => {
+                        return Err("database is locked".into());
                     }
                     DbOp::Update { key_col, row, .. } => {
                         if let Some(r) = store
@@ -507,7 +516,10 @@ mod tests {
             .insert("pbs.willow.staged".into(), "tok-secret-1".into());
         store
             .secrets
-            .insert("pbs.willow2.staged".into(), "tok-secret-2".into());
+            .insert("pbs.a.staged".into(), "tok-secret-a".into());
+        store
+            .secrets
+            .insert("pbs.b.staged".into(), "tok-secret-b".into());
         Rc::new(RefCell::new(store))
     }
 
@@ -515,7 +527,7 @@ mod tests {
         PbsCreateArgs {
             name: name.into(),
             token_id: "root@pam!orca".into(),
-            token_secret_ref: "pbs.willow.staged".into(),
+            token_secret_ref: format!("pbs.{name}.staged"),
             fingerprint: Some(FP.to_lowercase()),
             insecure: false,
             routes: vec![route::parse_route("lan_v4=https://10.0.0.5:8007").unwrap()],
@@ -592,10 +604,11 @@ mod tests {
             let rt = rt();
             rt.block_on(pbs_create(create_args("willow"), &ctx()))
                 .unwrap();
+            secrets::set("pbs.willow.staged", "tok-secret-2", None).unwrap();
             rt.block_on(pbs_update(
                 PbsUpdateArgs {
                     name: "willow".into(),
-                    token_secret_ref: Some("pbs.willow2.staged".into()),
+                    token_secret_ref: Some("pbs.willow.staged".into()),
                     fingerprint: Some(String::new()),
                     ..Default::default()
                 },
@@ -603,10 +616,14 @@ mod tests {
             ))
             .unwrap()
         });
-        assert_eq!(out.applied, vec!["fingerprint", "token_secret"]);
+        assert_eq!(out.applied, vec!["token_secret", "fingerprint"]);
         let s = store.borrow();
         assert_eq!(s.secrets["pbs.willow.token_secret"], "tok-secret-2");
         assert!(!s.secrets.contains_key("pbs.willow.fingerprint"));
+        assert!(
+            !s.secrets.contains_key("pbs.willow.staged"),
+            "update removes the staged copy"
+        );
     }
 
     #[test]
@@ -635,9 +652,8 @@ mod tests {
 
     #[test]
     fn a_missing_secret_reference_is_refused_before_any_write() {
-        let store = staged(Store::default());
-        let mut a = create_args("willow");
-        a.token_secret_ref = "pbs.never.staged".into();
+        let store = Rc::new(RefCell::new(Store::default()));
+        let a = create_args("willow");
         let err = with_store(&store, || rt().block_on(pbs_create(a, &ctx())).unwrap_err());
         assert!(err.to_string().contains("--value-stdin"), "{err}");
         assert!(store.borrow().rows.is_empty());
@@ -673,7 +689,6 @@ mod tests {
             let rt = rt();
             rt.block_on(pbs_create(create_args("a"), &ctx())).unwrap();
             assert_eq!(select(None).unwrap().name, "a");
-            secrets::set("pbs.willow.staged", "tok-secret-1", None).unwrap();
             rt.block_on(pbs_create(create_args("b"), &ctx())).unwrap();
             assert!(select(None)
                 .unwrap_err()
@@ -696,18 +711,23 @@ mod tests {
         for r in [
             "gitea.main.token",
             "pbs.other.token_secret",
+            "pbs.a.staged",
             "pbs..staged",
             "pbs.a.b.staged",
+            "pasted-secret-value",
         ] {
             let mut a = create_args("willow");
             a.token_secret_ref = r.into();
-            let err = with_store(&store, || rt().block_on(pbs_create(a, &ctx())).unwrap_err());
-            assert!(err.to_string().contains("pbs.<name>.staged"), "{r}: {err}");
+            let err = with_store(&store, || rt().block_on(pbs_create(a, &ctx())).unwrap_err())
+                .to_string();
+            assert!(err.contains("pbs.willow.staged"), "{r}: {err}");
+            assert!(!err.contains(r), "rejected ref echoed: {err}");
         }
         let s = store.borrow();
         assert!(s.rows.is_empty());
         assert_eq!(s.secrets["gitea.main.token"], "other");
         assert_eq!(s.secrets["pbs.other.token_secret"], "other");
+        assert_eq!(s.secrets["pbs.a.staged"], "tok-secret-a");
     }
 
     #[test]
@@ -715,15 +735,16 @@ mod tests {
         let store = staged(Store::default());
         with_store(&store, || {
             rt().block_on(pbs_create(create_args("willow"), &ctx()))
-                .unwrap()
+                .unwrap();
+            secrets::set("pbs.willow.staged", "tok-secret-2", None).unwrap();
         });
-        store.borrow_mut().fail_secret_set = true;
+        store.borrow_mut().fail_db_update = true;
         let err = with_store(&store, || {
             rt().block_on(pbs_update(
                 PbsUpdateArgs {
                     name: "willow".into(),
                     insecure: Some(true),
-                    token_secret_ref: Some("pbs.willow2.staged".into()),
+                    token_secret_ref: Some("pbs.willow.staged".into()),
                     ..Default::default()
                 },
                 &ctx(),
@@ -731,10 +752,37 @@ mod tests {
             .unwrap_err()
         })
         .to_string();
-        assert!(err.contains("already applied: [insecure]"), "{err}");
+        assert!(err.contains("already applied: [token_secret]"), "{err}");
         assert!(!err.contains("tok-secret-2"), "{err}");
+    }
+
+    /// A new token_id must never sit beside the old token's secret: if the
+    /// secret write fails, the row keeps the old id.
+    #[test]
+    fn update_writes_the_secret_before_a_new_token_id() {
+        let store = staged(Store::default());
+        with_store(&store, || {
+            rt().block_on(pbs_create(create_args("willow"), &ctx()))
+                .unwrap();
+            secrets::set("pbs.willow.staged", "tok-secret-2", None).unwrap();
+        });
+        store.borrow_mut().fail_secret_set = true;
+        with_store(&store, || {
+            rt().block_on(pbs_update(
+                PbsUpdateArgs {
+                    name: "willow".into(),
+                    token_id: Some("orca@pbs!new".into()),
+                    token_secret_ref: Some("pbs.willow.staged".into()),
+                    ..Default::default()
+                },
+                &ctx(),
+            ))
+            .unwrap_err()
+        });
+        let row = with_store(&store, || select(Some("willow")).unwrap());
+        assert_eq!(row.token_id, "root@pam!orca");
         assert!(
-            store.borrow().secrets.contains_key("pbs.willow2.staged"),
+            store.borrow().secrets.contains_key("pbs.willow.staged"),
             "the staged secret survives a failed copy"
         );
     }

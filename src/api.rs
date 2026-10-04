@@ -224,8 +224,10 @@ fn yes() -> bool {
 
 /// Active for `enable`/`expire` as PBS reports them: enabled unless `false`,
 /// never expiring when `expire` is 0 or absent.
+/// Mirrors PBS `User::is_active`: an expiry of 0 or below means never, and
+/// one equal to `now` has already expired.
 pub fn is_active(enable: Option<bool>, expire: Option<i64>, now: i64) -> bool {
-    enable != Some(false) && expire.is_none_or(|e| e == 0 || e > now)
+    enable != Some(false) && expire.is_none_or(|e| e <= 0 || e > now)
 }
 
 pub async fn users(c: &PbsClient) -> Result<Vec<User>> {
@@ -362,12 +364,10 @@ pub struct NsContents {
 }
 
 impl NsContents {
-    /// `groups=<n>,snapshots=<n>@<last backup epoch>`.
+    /// `g<groups>.s<snapshots>@<last backup epoch>`. No commas: the CLI
+    /// splits `--items` on them.
     pub fn fingerprint(&self) -> String {
-        format!(
-            "groups={},snapshots={}@{}",
-            self.groups, self.snapshots, self.last_backup
-        )
+        format!("g{}.s{}@{}", self.groups, self.snapshots, self.last_backup)
     }
 }
 
@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(m.log().len(), 3, "hosts, hosts/freyr, hosts/baldur");
         assert_eq!(got.groups, 9);
         assert_eq!(got.snapshots, 108);
-        assert_eq!(got.fingerprint(), "groups=9,snapshots=108@1791000000");
+        assert_eq!(got.fingerprint(), "g9.s108@1791000000");
     }
 
     #[test]
@@ -617,6 +617,9 @@ mod tests {
         assert!(is_active(Some(true), Some(200), 100));
         assert!(!is_active(Some(true), Some(50), 100));
         assert!(!is_active(Some(false), None, 100));
+        assert!(!is_active(None, Some(100), 100), "expires at now");
+        assert!(is_active(None, Some(101), 100));
+        assert!(is_active(None, Some(-1), 100), "PBS treats <= 0 as never");
     }
 
     #[test]
