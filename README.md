@@ -30,6 +30,7 @@ Run it directly:
 docker run -d --name pbs -p 8007:8007 \
   --tmpfs /run/proxmox-backup:rw,nosuid,nodev,mode=0755 \
   -v pbs-config:/etc/proxmox-backup \
+  -v pbs-lib:/var/lib/proxmox-backup \
   -v pbs-logs:/var/log/proxmox-backup \
   -v /srv/backups:/mnt/datastore/primary \
   ghcr.io/argyle-labs/pbs:4.2
