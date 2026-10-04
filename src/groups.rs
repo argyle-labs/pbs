@@ -9,7 +9,7 @@ use crate::api::{self, GcStatus};
 use crate::client::{encode, PbsClient};
 use crate::endpoint;
 use crate::plan::{self, ApiCall, Change, Step};
-use crate::times::{self, When};
+use crate::times::{self, When, Zones};
 
 /// Fleet retention policy: keep the last 10 snapshots per group.
 pub const DEFAULT_KEEP_LAST: u64 = 10;
@@ -112,6 +112,17 @@ async fn datastores(c: &PbsClient, named: &[String], all: bool) -> Result<Vec<St
     }
 }
 
+/// `<store>:ns=<ns|root>:<type>/<id>`, the plan item naming one group.
+pub fn group_target(
+    store: &str,
+    ns: &Option<String>,
+    backup_type: &str,
+    backup_id: &str,
+) -> String {
+    let ns = ns.as_deref().filter(|n| !n.is_empty()).unwrap_or("root");
+    format!("{store}:ns={ns}:{backup_type}/{backup_id}")
+}
+
 fn offset(s: &Option<String>) -> Result<Option<i32>> {
     s.as_deref().map(times::parse_offset).transpose()
 }
@@ -174,7 +185,8 @@ pub struct GroupDeleteArgs {
     #[arg(long = "datastore")]
     #[serde(default)]
     pub datastores: Vec<String>,
-    /// Delete from every datastore that holds the group.
+    /// Delete from every datastore that holds the group, including sync
+    /// targets that keep a replica of it.
     #[arg(long)]
     #[serde(default)]
     pub all_datastores: bool,
@@ -186,17 +198,25 @@ pub struct GroupDeleteArgs {
     pub backup_type: String,
     #[arg(long)]
     pub backup_id: String,
+    /// The dry run's change targets to apply (execute only). Comma-separated
+    /// on the CLI.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default)]
+    pub items: Vec<String>,
     #[arg(long)]
     #[serde(default)]
     pub execute: bool,
 }
 
-/// One delete step per datastore that holds the group.
+/// One delete step per datastore that holds the group. Each target ends in
+/// `#<snapshots>@<last backup>`, so a group that gained or lost snapshots
+/// after the dry run no longer matches the confirmed item.
 pub fn group_delete_steps(
     found: &[(String, Vec<Group>)],
     ns: &Option<String>,
     backup_type: &str,
     backup_id: &str,
+    all_datastores: bool,
 ) -> (Vec<Step>, Vec<String>) {
     let mut steps = Vec::new();
     let mut notes = Vec::new();
@@ -213,20 +233,29 @@ pub fn group_delete_steps(
             ("backup-id".to_string(), backup_id.to_string()),
         ];
         query.extend(ns_query(ns).into_iter().map(|(k, v)| (k.to_string(), v)));
-        let last = When::new(g.last_backup, None);
+        let mut detail = format!(
+            "{} snapshots, last {}; protected snapshots make PBS refuse",
+            g.backup_count,
+            times::utc(g.last_backup)
+        );
+        if all_datastores {
+            detail.push_str("; all_datastores also deletes the replica on sync targets");
+        }
         steps.push(
             Step::new(
-                format!("{store}:{backup_type}/{backup_id}"),
+                format!(
+                    "{}#{}@{}",
+                    group_target(store, ns, backup_type, backup_id),
+                    g.backup_count,
+                    g.last_backup
+                ),
                 "delete-group",
                 ApiCall::Delete {
                     path: store_path(store, "/groups"),
                     query,
                 },
             )
-            .detail(format!(
-                "{} snapshots, last {}; protected snapshots make PBS refuse",
-                g.backup_count, last.utc
-            )),
+            .detail(detail),
         );
     }
     (steps, notes)
@@ -248,7 +277,16 @@ pub async fn pbs_group_delete(args: GroupDeleteArgs, ctx: &ToolCtx) -> Result<Ch
     for s in stores {
         found.push((s.clone(), groups(&c, &s, &args.ns).await?));
     }
-    let (steps, notes) = group_delete_steps(&found, &args.ns, &args.backup_type, &args.backup_id);
+    let (steps, notes) = group_delete_steps(
+        &found,
+        &args.ns,
+        &args.backup_type,
+        &args.backup_id,
+        args.all_datastores,
+    );
+    if args.execute {
+        refuse_changed_groups(TOOL, &steps, &args.items)?;
+    }
     let summary = format!("delete group {}/{}", args.backup_type, args.backup_id);
     plan::plan_or_apply(
         TOOL,
@@ -259,9 +297,25 @@ pub async fn pbs_group_delete(args: GroupDeleteArgs, ctx: &ToolCtx) -> Result<Ch
         summary,
         steps,
         notes,
-        None,
+        Some(&args.items),
     )
     .await
+}
+
+/// A confirmed group whose snapshot count or last backup moved since the dry
+/// run is a refusal, not a skip: the operator approved deleting what they saw.
+pub fn refuse_changed_groups(tool: &str, steps: &[Step], items: &[String]) -> Result<()> {
+    let changed: Vec<&String> = items
+        .iter()
+        .filter(|i| !steps.iter().any(|s| &s.target == *i))
+        .collect();
+    if !changed.is_empty() {
+        bail!(
+            "{tool}: refusing: {} changed or vanished since the dry run; re-run it and confirm the new items",
+            changed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -363,10 +417,15 @@ pub struct PruneArgs {
     #[arg(long)]
     #[serde(default)]
     pub ns: Option<String>,
-    /// Limit to one backup type (`vm`, `ct`, `host`).
+    /// Limit to one backup type (`vm`, `ct`, `host`). Required unless
+    /// `all_groups`.
     #[arg(long)]
     #[serde(default)]
     pub backup_type: Option<String>,
+    /// Prune every group in the namespace.
+    #[arg(long)]
+    #[serde(default)]
+    pub all_groups: bool,
     /// Limit to one backup id (requires `backup_type`).
     #[arg(long)]
     #[serde(default)]
@@ -391,6 +450,11 @@ pub struct PruneArgs {
     #[arg(long)]
     #[serde(default)]
     pub keep_yearly: Option<u64>,
+    /// The dry run's change targets to apply (execute only). Comma-separated
+    /// on the CLI.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default)]
+    pub items: Vec<String>,
     #[arg(long)]
     #[serde(default)]
     pub execute: bool,
@@ -466,15 +530,15 @@ pub fn prune_steps(
             let mut detail = format!(
                 "removes {} snapshots ({} .. {}), keeps {kept}",
                 doomed.len(),
-                When::new(oldest, Some(0)).utc,
-                When::new(newest, Some(0)).utc
+                times::utc(oldest),
+                times::utc(newest)
             );
             if protected > 0 {
                 detail.push_str(&format!("; {protected} protected snapshots stay"));
             }
             Some(
                 Step::new(
-                    format!("{store}:{t}/{id}"),
+                    group_target(store, ns, t, id),
                     "prune",
                     ApiCall::Post {
                         path: store_path(store, "/prune"),
@@ -504,6 +568,11 @@ async fn prune(
     const TOOL: &str = "pbs.prune";
     if args.backup_id.is_some() && args.backup_type.is_none() {
         bail!("backup_id needs backup_type");
+    }
+    match (args.backup_type.is_some(), args.all_groups) {
+        (false, false) => bail!("name a backup_type, or set all_groups to prune every group"),
+        (true, true) => bail!("pass either backup_type or all_groups, not both"),
+        _ => {}
     }
     let keep = args.keep();
     let targets: Vec<(String, String)> = groups(c, &args.datastore, &args.ns)
@@ -544,7 +613,7 @@ async fn prune(
         summary,
         steps,
         vec![],
-        None,
+        Some(&args.items),
     )
     .await
 }
@@ -561,7 +630,7 @@ pub struct GcDetailArgs {
     pub endpoint: Option<String>,
     #[arg(long)]
     pub datastore: String,
-    /// Render local times at this offset instead of the orca host's zone.
+    /// Also render times at this offset (`-06:00`), e.g. the caller's zone.
     #[arg(long)]
     #[serde(default)]
     pub utc_offset: Option<String>,
@@ -579,6 +648,8 @@ pub struct PendingRemovals {
 #[serde(rename_all = "camelCase")]
 pub struct GcDetailOutput {
     pub datastore: String,
+    /// Zone PBS evaluates the GC schedule in.
+    pub server_timezone: String,
     pub status: GcStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run: Option<When>,
@@ -587,11 +658,12 @@ pub struct GcDetailOutput {
     pub pending_removals: PendingRemovals,
 }
 
-pub fn gc_detail(store: &str, status: GcStatus, off: Option<i32>) -> GcDetailOutput {
+pub fn gc_detail(store: &str, status: GcStatus, zone: String, zones: Zones) -> GcDetailOutput {
     GcDetailOutput {
         datastore: store.to_string(),
-        last_run: status.last_run_endtime.map(|e| When::new(e, off)),
-        next_run: status.next_run.map(|e| When::new(e, off)),
+        server_timezone: zone,
+        last_run: status.last_run_endtime.map(|e| When::new(e, zones)),
+        next_run: status.next_run.map(|e| When::new(e, zones)),
         pending_removals: PendingRemovals {
             chunks: status.pending_chunks,
             bytes: status.pending_bytes,
@@ -609,7 +681,13 @@ pub async fn pbs_gc_detail(args: GcDetailArgs, _ctx: &ToolCtx) -> Result<GcDetai
     let off = offset(&args.utc_offset)?;
     let c = endpoint::connect(args.endpoint.as_deref()).await?;
     let status = api::gc_status(&c, &args.datastore).await?;
-    Ok(gc_detail(&args.datastore, status, off))
+    let (zone, server) = times::server_clock(&c).await;
+    Ok(gc_detail(
+        &args.datastore,
+        status,
+        zone,
+        Zones { server, local: off },
+    ))
 }
 
 #[orca_struct(args)]
@@ -667,10 +745,26 @@ mod tests {
     use crate::api::fixtures::*;
     use crate::client::mock::MockTransport;
     use crate::client::Method;
-    use crate::plan::admin;
+    use crate::plan::{admin, items};
 
     fn fixture_groups() -> Vec<Group> {
         serde_json::from_value(data(GROUPS_LIST)).unwrap()
+    }
+
+    #[test]
+    fn group_target_names_store_namespace_and_group() {
+        assert_eq!(
+            group_target("main", &None, "vm", "111"),
+            "main:ns=root:vm/111"
+        );
+        assert_eq!(
+            group_target("main", &Some(String::new()), "vm", "111"),
+            "main:ns=root:vm/111"
+        );
+        assert_eq!(
+            group_target("main", &Some("hosts/freyr".into()), "host", "freyr"),
+            "main:ns=hosts/freyr:host/freyr"
+        );
     }
 
     #[test]
@@ -679,9 +773,9 @@ mod tests {
             ("main".to_string(), fixture_groups()),
             ("archive".to_string(), fixture_groups()[2..].to_vec()),
         ];
-        let (steps, notes) = group_delete_steps(&found, &None, "vm", "111");
+        let (steps, notes) = group_delete_steps(&found, &None, "vm", "111", false);
         assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].target, "main:vm/111");
+        assert_eq!(steps[0].target, "main:ns=root:vm/111#12@1790985600");
         assert_eq!(
             steps[0].call,
             ApiCall::Delete {
@@ -692,16 +786,20 @@ mod tests {
                 ],
             }
         );
-        assert!(steps[0]
+        let d = steps[0].detail.as_deref().unwrap();
+        assert!(d.starts_with("12 snapshots"), "{d}");
+        assert!(!d.contains("sync targets"));
+        assert_eq!(notes, vec!["archive: no group vm/111"]);
+        let (all, _) = group_delete_steps(&found, &None, "vm", "111", true);
+        assert!(all[0]
             .detail
             .as_deref()
             .unwrap()
-            .starts_with("12 snapshots"));
-        assert_eq!(notes, vec!["archive: no group vm/111"]);
+            .contains("replica on sync targets"));
     }
 
     #[tokio::test]
-    async fn group_delete_execute_reports_what_pbs_removed() {
+    async fn namespaced_group_delete_sends_the_namespace() {
         let m = MockTransport::new();
         m.on(
             Method::Delete,
@@ -709,8 +807,14 @@ mod tests {
             200,
             GROUP_DELETE,
         );
+        let ns = Some("hosts/freyr".to_string());
         let found = vec![("main".to_string(), fixture_groups())];
-        let (steps, notes) = group_delete_steps(&found, &None, "ct", "114");
+        let (steps, notes) = group_delete_steps(&found, &ns, "host", "freyr", false);
+        assert_eq!(
+            steps[0].target,
+            "main:ns=hosts/freyr:host/freyr#14@1791000000"
+        );
+        let confirmed = items(&steps);
         let out = plan::plan_or_apply(
             "pbs.group.delete",
             &json!({}),
@@ -720,7 +824,7 @@ mod tests {
             "s".into(),
             steps,
             notes,
-            None,
+            Some(&confirmed),
         )
         .await
         .unwrap();
@@ -730,8 +834,22 @@ mod tests {
         assert_eq!(a.steps[0].result["removed-snapshots"], json!(12));
         assert_eq!(
             m.log(),
-            vec!["DELETE /admin/datastore/main/groups?backup-type=ct&backup-id=114"]
+            vec!["DELETE /admin/datastore/main/groups?backup-type=host&backup-id=freyr&ns=hosts%2Ffreyr"]
         );
+    }
+
+    #[test]
+    fn group_delete_refuses_a_group_that_changed_since_the_plan() {
+        let found = vec![("main".to_string(), fixture_groups())];
+        let (planned, _) = group_delete_steps(&found, &None, "vm", "111", false);
+        let confirmed = items(&planned);
+        let mut grown = fixture_groups();
+        grown[0].backup_count += 1;
+        let (now, _) =
+            group_delete_steps(&[("main".to_string(), grown)], &None, "vm", "111", false);
+        let err = refuse_changed_groups("pbs.group.delete", &now, &confirmed).unwrap_err();
+        assert!(err.to_string().contains("changed or vanished"), "{err}");
+        assert!(refuse_changed_groups("pbs.group.delete", &planned, &confirmed).is_ok());
     }
 
     #[test]
@@ -758,6 +876,7 @@ mod tests {
         ];
         let steps = prune_steps("main", &keep, &Some("hosts/freyr".into()), &previews);
         assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].target, "main:ns=hosts/freyr:vm/111");
         let d = steps[0].detail.as_deref().unwrap();
         assert!(d.starts_with("removes 1 snapshots"), "{d}");
         assert!(d.contains("1 protected snapshots stay"), "{d}");
@@ -776,8 +895,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prune_dry_run_asks_pbs_with_dry_run_true_and_never_prunes() {
+    fn prune_mock() -> MockTransport {
         let m = MockTransport::new();
         m.on(
             Method::Get,
@@ -791,6 +909,39 @@ mod tests {
             200,
             PRUNE_DRY_RUN,
         );
+        m
+    }
+
+    #[tokio::test]
+    async fn prune_needs_a_type_or_all_groups() {
+        let m = prune_mock();
+        let base = PruneArgs {
+            datastore: "main".into(),
+            ..Default::default()
+        };
+        let err = prune(&m.client(), &base, None).await.unwrap_err();
+        assert!(err.to_string().contains("all_groups"), "{err}");
+        let both = PruneArgs {
+            backup_type: Some("vm".into()),
+            all_groups: true,
+            datastore: "main".into(),
+            ..Default::default()
+        };
+        assert!(prune(&m.client(), &both, None).await.is_err());
+        assert!(m.log().is_empty());
+        let all = PruneArgs {
+            all_groups: true,
+            ..base
+        };
+        let Change::Plan(p) = prune(&m.client(), &all, None).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(p.changes.len(), 3, "every group previewed as prunable");
+    }
+
+    #[tokio::test]
+    async fn prune_dry_run_asks_pbs_with_dry_run_true_and_never_prunes() {
+        let m = prune_mock();
         let args = PruneArgs {
             datastore: "main".into(),
             backup_type: Some("vm".into()),
@@ -805,6 +956,11 @@ mod tests {
         assert_eq!(m.body_of(1)["dry-run"], json!(true));
         let mut exec = args;
         exec.execute = true;
+        assert!(
+            prune(&m.client(), &exec, Some(&admin())).await.is_err(),
+            "no items"
+        );
+        exec.items = p.changes.iter().map(|c| c.target.clone()).collect();
         prune(&m.client(), &exec, Some(&admin())).await.unwrap();
         let last = m.calls.lock().unwrap().len() - 1;
         assert_eq!(m.body_of(last)["dry-run"], json!(false));
@@ -820,11 +976,21 @@ mod tests {
     #[test]
     fn gc_detail_surfaces_pending_removals() {
         let st: GcStatus = serde_json::from_value(data(GC_STATUS)).unwrap();
-        let d = gc_detail("main", st, Some(0));
+        let d = gc_detail(
+            "main",
+            st,
+            "UTC".into(),
+            Zones {
+                server: Some(0),
+                local: None,
+            },
+        );
         assert_eq!(d.pending_removals.chunks, 3);
         assert_eq!(d.pending_removals.bytes, 7_340_032);
         assert!(d.pending_removals.why.contains("24h 5min"));
-        assert_eq!(d.next_run.unwrap().epoch, 1_759_636_800);
+        let next = d.next_run.unwrap();
+        assert_eq!(next.epoch, 1_759_636_800);
+        assert!(next.server.is_some() && next.local.is_none());
     }
 
     #[test]

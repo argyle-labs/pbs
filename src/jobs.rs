@@ -10,7 +10,7 @@ use plugin_toolkit::serde_json::{Map, Value};
 use crate::client::{encode, PbsClient};
 use crate::endpoint;
 use crate::plan::{self, ApiCall, Change, Step};
-use crate::times::{self, When};
+use crate::times::{self, When, Zones};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -78,13 +78,13 @@ pub struct JobView {
     pub config: Map<String, Value>,
 }
 
-pub fn view(raw: &Value, zone: &str, offset: Option<i32>) -> Option<JobView> {
+pub fn view(raw: &Value, zone: &str, zones: Zones) -> Option<JobView> {
     let obj = raw.as_object()?;
     let s = |k: &str| obj.get(k).and_then(Value::as_str).map(str::to_string);
     let t = |k: &str| {
         obj.get(k)
             .and_then(Value::as_i64)
-            .map(|e| When::new(e, offset))
+            .map(|e| When::new(e, zones))
     };
     let config = obj
         .iter()
@@ -104,17 +104,6 @@ pub fn view(raw: &Value, zone: &str, offset: Option<i32>) -> Option<JobView> {
     })
 }
 
-pub async fn server_zone(c: &PbsClient) -> String {
-    match c.get::<Value>("/nodes/localhost/time", &[]).await {
-        Ok(v) => v
-            .get("timezone")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string(),
-        Err(_) => "unknown".to_string(),
-    }
-}
-
 pub async fn raw_jobs(c: &PbsClient, kind: Kind, store: Option<&str>) -> Result<Vec<Value>> {
     c.get(&kind.admin_path(), &kind.list_query(store)).await
 }
@@ -124,6 +113,19 @@ async fn find_job(c: &PbsClient, kind: Kind, id: &str) -> Result<Option<Value>> 
         .await?
         .into_iter()
         .find(|j| j.get("id").and_then(Value::as_str) == Some(id)))
+}
+
+/// The section's config digest, echoed on update so PBS refuses the write if
+/// the job changed since it was read.
+async fn config_digest(c: &PbsClient, kind: Kind, id: &str) -> Result<Option<String>> {
+    let env = c
+        .get_envelope(&format!("{}/{}", kind.config_path(), encode(id)), &[])
+        .await?;
+    Ok(env
+        .extra
+        .get("digest")
+        .and_then(Value::as_str)
+        .map(str::to_string))
 }
 
 /// Field changes `desired` makes over `current`, as `(key, old, new)`.
@@ -171,6 +173,7 @@ pub fn update_steps(
     id: &str,
     fields: Map<String, Value>,
     clear: &[String],
+    digest: Option<&str>,
 ) -> Result<Vec<Step>> {
     let current = existing
         .and_then(Value::as_object)
@@ -199,6 +202,9 @@ pub fn update_steps(
                 .join(", ")
         ));
         body.insert("delete".into(), json!(clear));
+    }
+    if let Some(d) = digest {
+        body.insert("digest".into(), json!(d));
     }
     Ok(vec![Step::new(
         format!("{} job {id}", kind.name()),
@@ -265,11 +271,12 @@ async fn list_with(
     store: Option<&str>,
     off: Option<i32>,
 ) -> Result<JobListOutput> {
-    let zone = server_zone(c).await;
+    let (zone, server) = times::server_clock(c).await;
+    let zones = Zones { server, local: off };
     let jobs = raw_jobs(c, kind, store)
         .await?
         .iter()
-        .filter_map(|j| view(j, &zone, off))
+        .filter_map(|j| view(j, &zone, zones))
         .collect();
     Ok(JobListOutput {
         server_timezone: zone,
@@ -286,11 +293,16 @@ async fn mutate<A: Serialize>(
     id: &str,
     execute: bool,
     ctx: &ToolCtx,
-    build: impl FnOnce(Option<&Value>) -> Result<Vec<Step>>,
+    with_digest: bool,
+    build: impl FnOnce(Option<&Value>, Option<&str>) -> Result<Vec<Step>>,
 ) -> Result<Change> {
     let c = endpoint::connect(endpoint).await?;
     let existing = find_job(&c, kind, id).await?;
-    let steps = build(existing.as_ref())?;
+    let digest = match (&existing, with_digest) {
+        (Some(_), true) => config_digest(&c, kind, id).await?,
+        _ => None,
+    };
+    let steps = build(existing.as_ref(), digest.as_deref())?;
     let summary = format!("{} job {id}", kind.name());
     plan::plan_or_apply(
         tool,
@@ -451,7 +463,8 @@ pub async fn pbs_sync_job_create(args: SyncJobCreateArgs, ctx: &ToolCtx) -> Resu
         &args.id,
         args.execute,
         ctx,
-        |e| create_steps(Kind::Sync, e, &args.id, fields),
+        false,
+        |e, _| create_steps(Kind::Sync, e, &args.id, fields),
     )
     .await
 }
@@ -493,7 +506,8 @@ pub async fn pbs_sync_job_update(args: SyncJobUpdateArgs, ctx: &ToolCtx) -> Resu
         &args.id,
         args.execute,
         ctx,
-        |e| update_steps(Kind::Sync, e, &args.id, fields, &args.clear),
+        true,
+        |e, d| update_steps(Kind::Sync, e, &args.id, fields, &args.clear, d),
     )
     .await
 }
@@ -527,7 +541,8 @@ pub async fn pbs_sync_job_run(args: JobRunArgs, ctx: &ToolCtx) -> Result<Change>
         &args.id,
         args.execute,
         ctx,
-        |e| run_steps(Kind::Sync, e, &args.id),
+        false,
+        |e, _| run_steps(Kind::Sync, e, &args.id),
     )
     .await
 }
@@ -634,7 +649,8 @@ pub async fn pbs_verify_job_create(args: VerifyJobCreateArgs, ctx: &ToolCtx) -> 
         &args.id,
         args.execute,
         ctx,
-        |e| create_steps(Kind::Verify, e, &args.id, fields),
+        false,
+        |e, _| create_steps(Kind::Verify, e, &args.id, fields),
     )
     .await
 }
@@ -676,7 +692,8 @@ pub async fn pbs_verify_job_update(args: VerifyJobUpdateArgs, ctx: &ToolCtx) -> 
         &args.id,
         args.execute,
         ctx,
-        |e| update_steps(Kind::Verify, e, &args.id, fields, &args.clear),
+        true,
+        |e, d| update_steps(Kind::Verify, e, &args.id, fields, &args.clear, d),
     )
     .await
 }
@@ -697,7 +714,8 @@ pub async fn pbs_verify_job_run(args: JobRunArgs, ctx: &ToolCtx) -> Result<Chang
         &args.id,
         args.execute,
         ctx,
-        |e| run_steps(Kind::Verify, e, &args.id),
+        false,
+        |e, _| run_steps(Kind::Verify, e, &args.id),
     )
     .await
 }
@@ -726,7 +744,8 @@ mod tests {
         assert_eq!(j.schedule.as_deref(), Some("05:30"));
         let next = j.next_run.as_ref().unwrap();
         assert_eq!(next.utc, "2026-10-04 05:30:00 +00:00");
-        assert_eq!(next.local, "2026-10-03 23:30:00 -06:00");
+        assert_eq!(next.local.as_deref(), Some("2026-10-03 23:30:00 -06:00"));
+        assert_eq!(next.server.as_deref(), Some("2026-10-04 05:30:00 +00:00"));
         assert!(!j.config.contains_key("next-run"));
         assert!(m.log()[1].contains("sync-direction=all") && m.log()[1].contains("store=archive"));
     }
@@ -772,7 +791,8 @@ mod tests {
             Some(&job),
             "willow-to-maple",
             same.to_map(),
-            &[]
+            &[],
+            Some("d1")
         )
         .unwrap()
         .is_empty());
@@ -787,13 +807,14 @@ mod tests {
             "willow-to-maple",
             changed.to_map(),
             &["comment".into(), "transfer-last".into()],
+            Some("d1"),
         )
         .unwrap();
         assert_eq!(
             steps[0].call,
             ApiCall::Put {
                 path: "/config/sync/willow-to-maple".into(),
-                body: json!({"schedule": "04:00", "delete": ["comment"]}),
+                body: json!({"schedule": "04:00", "delete": ["comment"], "digest": "d1"}),
             }
         );
         assert!(steps[0]
@@ -801,7 +822,7 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("schedule: \"05:30\" -> \"04:00\""));
-        assert!(update_steps(Kind::Sync, None, "nope", Map::new(), &[]).is_err());
+        assert!(update_steps(Kind::Sync, None, "nope", Map::new(), &[], None).is_err());
     }
 
     #[test]

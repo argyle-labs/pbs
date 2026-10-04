@@ -1,8 +1,22 @@
 //! Epoch rendering for job schedules. PBS evaluates schedules in the server's
-//! own zone — UTC for the container image — which is rarely the operator's, so
-//! every run time is shown in both UTC and local time.
+//! own zone (UTC for the container image), which is rarely the operator's, so
+//! run times are shown in UTC, in the server's zone, and at the caller's
+//! `utc_offset` when one is given. There is no host-local rendering: orca's
+//! time primitives expose no local zone, and the plugin may run on any host.
 
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::serde_json::Value;
+
+use crate::client::PbsClient;
+
+/// Offsets (seconds east of UTC) to render besides UTC.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Zones {
+    /// The PBS server's zone, from `/nodes/localhost/time`.
+    pub server: Option<i32>,
+    /// The caller's `utc_offset`.
+    pub local: Option<i32>,
+}
 
 #[orca_struct]
 #[derive(Debug, Clone, PartialEq)]
@@ -10,18 +24,49 @@ pub struct When {
     pub epoch: i64,
     /// `YYYY-MM-DD HH:MM:SS +00:00`.
     pub utc: String,
-    /// The same instant in local time (the orca host's zone, or `utc_offset`).
-    pub local: String,
+    /// The same instant in the PBS server's zone, the one its schedules use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// The same instant at the caller's `utc_offset`; absent without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<String>,
 }
 
 impl When {
-    pub fn new(epoch: i64, offset: Option<i32>) -> Self {
-        let local_offset = offset.unwrap_or_else(|| host_offset(epoch));
+    pub fn new(epoch: i64, zones: Zones) -> Self {
         Self {
             epoch,
-            utc: format(epoch, 0),
-            local: format(epoch, local_offset),
+            utc: utc(epoch),
+            server: zones.server.map(|o| format(epoch, o)),
+            local: zones.local.map(|o| format(epoch, o)),
         }
+    }
+}
+
+pub fn utc(epoch: i64) -> String {
+    format(epoch, 0)
+}
+
+/// The PBS server's zone name and current UTC offset. `localtime` in the
+/// reply is the epoch shifted by the server's offset.
+pub async fn server_clock(c: &PbsClient) -> (String, Option<i32>) {
+    match c.get::<Value>("/nodes/localhost/time", &[]).await {
+        Ok(v) => {
+            let zone = v
+                .get("timezone")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let offset = match (
+                v.get("localtime").and_then(Value::as_i64),
+                v.get("time").and_then(Value::as_i64),
+            ) {
+                (Some(l), Some(t)) => i32::try_from(l - t).ok(),
+                _ => None,
+            };
+            (zone, offset)
+        }
+        Err(_) => ("unknown".to_string(), None),
     }
 }
 
@@ -47,20 +92,6 @@ pub fn parse_offset(s: &str) -> Result<i32> {
         bail!("utc_offset '{s}' is out of range");
     }
     Ok(sign * (h * 3600 + m * 60))
-}
-
-/// UTC offset of the host's zone at `epoch`, so DST is applied per instant.
-fn host_offset(epoch: i64) -> i32 {
-    let t = epoch as libc::time_t;
-    // SAFETY: localtime_r writes only into the zeroed `tm` we own and returns
-    // null on failure, which we treat as UTC.
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&t, &mut tm).is_null() {
-            return 0;
-        }
-        tm.tm_gmtoff as i32
-    }
 }
 
 fn format(epoch: i64, offset: i32) -> String {
@@ -102,9 +133,17 @@ mod tests {
     #[test]
     fn formats_utc_and_offset_local() {
         // 2026-10-04 05:30:00 UTC, the willow→maple sync time.
-        let w = When::new(1_791_091_800, Some(-6 * 3600));
+        let w = When::new(
+            1_791_091_800,
+            Zones {
+                server: Some(0),
+                local: Some(-6 * 3600),
+            },
+        );
         assert_eq!(w.utc, "2026-10-04 05:30:00 +00:00");
-        assert_eq!(w.local, "2026-10-03 23:30:00 -06:00");
+        assert_eq!(w.server.as_deref(), Some("2026-10-04 05:30:00 +00:00"));
+        assert_eq!(w.local.as_deref(), Some("2026-10-03 23:30:00 -06:00"));
+        assert_eq!(When::new(0, Zones::default()).local, None);
     }
 
     #[test]
@@ -123,8 +162,24 @@ mod tests {
         assert!(parse_offset("+25:00").is_err());
     }
 
-    #[test]
-    fn host_offset_is_whole_minutes() {
-        assert_eq!(host_offset(1_791_091_800) % 60, 0);
+    #[tokio::test]
+    async fn server_clock_reads_zone_and_offset() {
+        use crate::client::mock::MockTransport;
+        use crate::client::Method;
+        let m = MockTransport::new();
+        m.ok(
+            Method::Get,
+            "/nodes/localhost/time",
+            json!({"time": 1000, "localtime": 1000 - 21_600, "timezone": "America/Denver"}),
+        );
+        assert_eq!(
+            server_clock(&m.client()).await,
+            ("America/Denver".to_string(), Some(-21_600))
+        );
+        let none = MockTransport::new();
+        assert_eq!(
+            server_clock(&none.client()).await,
+            ("unknown".to_string(), None)
+        );
     }
 }

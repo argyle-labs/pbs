@@ -24,8 +24,6 @@ plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" 
 # PBS's self-signed cert by fingerprint, handed to reqwest as a preconfigured
 # rustls config. Same version reqwest already links.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-# localtime_r, to render job run times in the orca host's zone.
-libc = "0.2"
 
 [dev-dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
