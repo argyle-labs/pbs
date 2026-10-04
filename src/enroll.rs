@@ -308,7 +308,14 @@ pub fn diff_enroll(id: &Identity, st: &State, adopt: bool) -> Result<(Vec<Findin
             }
             let user_inactive = user.is_some_and(|u| !api::is_active(u.enable, u.expire, st.now));
             let rotate = match st.secret {
-                // Re-enabling restores the old secret's validity, so it is
+                SecretState::Missing => {
+                    findings.push(finding(
+                        "secret-missing",
+                        format!("orca holds no secret for {}", id.tokenid),
+                    ));
+                    true
+                }
+                // Re-enabling restores the held secret's validity, so it is
                 // never regenerated while inactive; the next run probes it.
                 _ if inactive || user_inactive => {
                     findings.push(finding(
@@ -322,13 +329,6 @@ pub fn diff_enroll(id: &Identity, st: &State, adopt: bool) -> Result<(Vec<Findin
                     false
                 }
                 SecretState::Inactive => false,
-                SecretState::Missing => {
-                    findings.push(finding(
-                        "secret-missing",
-                        format!("orca holds no secret for {}", id.tokenid),
-                    ));
-                    true
-                }
                 SecretState::Rejected => {
                     findings.push(finding(
                         "token-rotated",
@@ -468,7 +468,9 @@ pub fn diff_revoke(
     let ns_exists = st.namespaces.iter().any(|n| n.ns == id.ns);
     match (ns_exists, delete_data) {
         (true, true) => {
-            let contents = st.ns_contents.unwrap_or_default();
+            let contents = st
+                .ns_contents
+                .ok_or_else(|| anyhow!("namespace {} contents were not read", id.ns))?;
             let (ns_steps, _) = crate::tools::namespace_delete_steps(
                 &id.datastore,
                 &st.namespaces,
@@ -688,6 +690,7 @@ pub struct HostRevokeArgs {
 }
 
 #[orca_struct]
+#[derive(Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct HostRevokeOutput {
     pub host: String,
@@ -756,6 +759,7 @@ async fn revoke(
         });
     }
     plan::authorize_execute(TOOL, caller)?;
+    plan::refuse_drifted(TOOL, &steps, &args.items)?;
     let (mut steps, dropped) = plan::confirm(TOOL, steps, &args.items)?;
     stamp_acl_digest(&mut steps, st.acl_digest.as_deref());
     notes.extend(dropped);
@@ -1074,9 +1078,41 @@ mod tests {
             ]
         );
         assert!(notes[0].contains("are kept"));
-        let (steps, notes) = diff_revoke(&id, &state(SecretState::Unknown), true, false).unwrap();
-        assert_eq!(steps.last().unwrap().action, "delete-namespace");
+        assert!(
+            diff_revoke(&id, &state(SecretState::Unknown), true, false).is_err(),
+            "delete_data without the namespace contents read"
+        );
+        let mut st = state(SecretState::Unknown);
+        st.ns_contents = Some(api::NsContents {
+            groups: 1,
+            snapshots: 14,
+            last_backup: 1_791_000_000,
+        });
+        let (steps, notes) = diff_revoke(&id, &st, true, false).unwrap();
+        assert_eq!(
+            steps.last().unwrap().item(),
+            "delete-namespace main:hosts/freyr#g1.s14@1791000000"
+        );
         assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn missing_secret_on_an_inactive_token_is_regenerated_and_enabled() {
+        let id = Identity::new("freyr", "main").unwrap();
+        let mut st = state(SecretState::Missing);
+        st.users[1].tokens[0].expire = Some(1);
+        let (f, steps) = diff_enroll(&id, &st, false).unwrap();
+        assert!(kinds(&f).contains(&"secret-missing"));
+        let regen = steps
+            .iter()
+            .find(|s| s.action == "regenerate-token")
+            .expect("regenerate planned");
+        let ApiCall::Put { body, .. } = &regen.call else {
+            panic!()
+        };
+        assert_eq!(body["regenerate"], true);
+        assert_eq!(body["enable"], true);
+        assert_eq!(body["expire"], 0);
     }
 
     fn enroll_mock() -> MockTransport {
@@ -1295,13 +1331,23 @@ mod tests {
         items: Vec<String>,
         execute: bool,
     ) -> Result<HostRevokeOutput> {
+        run_revoke_with(store, m, items, execute, false)
+    }
+
+    fn run_revoke_with(
+        store: &Rc<RefCell<Store>>,
+        m: &MockTransport,
+        items: Vec<String>,
+        execute: bool,
+        delete_data: bool,
+    ) -> Result<HostRevokeOutput> {
         let id = Identity::new("freyr", "main").unwrap();
         let c = m.client();
         let args = HostRevokeArgs {
             endpoint: None,
             host: "freyr".into(),
             datastore: "main".into(),
-            delete_data: false,
+            delete_data,
             adopt: false,
             items,
             execute,
@@ -1345,6 +1391,61 @@ mod tests {
         assert!(out.secret_removed);
         assert!(!m.mutations().iter().any(|l| l.contains("namespace")));
         assert_eq!(m.mutations().len(), 7);
+        let calls = m.calls.lock().unwrap();
+        let acl_bodies: Vec<Value> = calls
+            .iter()
+            .filter(|c| c.url.ends_with("/access/acl") && c.method == Method::Put)
+            .map(|c| serde_json::from_slice(c.body.as_deref().unwrap()).unwrap())
+            .collect();
+        assert_eq!(acl_bodies.len(), 5);
+        assert_eq!(acl_bodies[0]["digest"], DIGEST, "first executed ACL write");
+        assert!(acl_bodies[1..].iter().all(|b| b.get("digest").is_none()));
+    }
+
+    #[test]
+    fn revoke_delete_data_binds_to_live_counts_and_refuses_growth() {
+        let store = Rc::new(RefCell::new(Store::default()));
+        let m = revoke_mock();
+        m.on(
+            Method::Get,
+            "/admin/datastore/main/groups",
+            200,
+            GROUPS_LIST,
+        );
+        m.ok(
+            Method::Delete,
+            "/admin/datastore/main/namespace",
+            Value::Null,
+        );
+        let Change::Plan(p) = run_revoke_with(&store, &m, vec![], false, true)
+            .unwrap()
+            .change
+        else {
+            panic!()
+        };
+        let items: Vec<String> = p.changes.iter().map(|c| c.target.clone()).collect();
+        assert!(
+            items.contains(&"delete-namespace main:hosts/freyr#g3.s36@1791000000".to_string()),
+            "{items:?}"
+        );
+        let mut grown: Value = serde_json::from_str(GROUPS_LIST).unwrap();
+        grown["data"][2]["backup-count"] = json!(15);
+        m.on(
+            Method::Get,
+            "/admin/datastore/main/groups",
+            200,
+            &grown.to_string(),
+        );
+        let err = run_revoke_with(&store, &m, items, true, true).unwrap_err();
+        assert!(
+            err.to_string().contains("changed since the dry run"),
+            "{err}"
+        );
+        assert!(
+            m.mutations().is_empty(),
+            "no ACL, token or user is removed when the data drifted: {:?}",
+            m.mutations()
+        );
     }
 
     #[test]

@@ -230,27 +230,38 @@ pub struct NamespaceDeleteArgs {
     execute_gated = false
 )]
 pub async fn pbs_namespace_delete(args: NamespaceDeleteArgs, ctx: &ToolCtx) -> Result<Change> {
-    const TOOL: &str = "pbs.namespace.delete";
     api::validate_ns(&args.ns)?;
     let c = endpoint::connect(args.endpoint.as_deref()).await?;
-    let existing = api::namespaces(&c, &args.datastore).await?;
+    namespace_delete(&c, &args, ctx.caller().as_ref()).await
+}
+
+async fn namespace_delete(
+    c: &PbsClient,
+    args: &NamespaceDeleteArgs,
+    caller: Option<&plugin_toolkit::contract::CallerIdentity>,
+) -> Result<Change> {
+    const TOOL: &str = "pbs.namespace.delete";
+    let existing = api::namespaces(c, &args.datastore).await?;
     let contents = if args.delete_groups {
-        Some(api::ns_contents(&c, &args.datastore, &existing, &args.ns).await?)
+        Some(api::ns_contents(c, &args.datastore, &existing, &args.ns).await?)
     } else {
         None
     };
     let (steps, notes) =
         namespace_delete_steps(&args.datastore, &existing, &args.ns, contents.as_ref());
+    if args.execute {
+        plan::refuse_drifted(TOOL, &steps, &args.items)?;
+    }
     let summary = format!(
         "delete namespace {} on datastore {}",
         args.ns, args.datastore
     );
     plan::plan_or_apply(
         TOOL,
-        &args,
+        args,
         args.execute,
-        ctx.caller().as_ref(),
-        &c,
+        caller,
+        c,
         summary,
         steps,
         notes,
@@ -415,6 +426,7 @@ mod tests {
     use crate::client::mock::MockTransport;
     use crate::client::Method;
     use crate::plan::admin;
+    use plugin_toolkit::serde_json::{json, Value};
 
     fn existing() -> Vec<Namespace> {
         plugin_toolkit::serde_json::from_value(data(NAMESPACE_LIST)).unwrap()
@@ -447,10 +459,7 @@ mod tests {
         };
         let (steps, _) =
             namespace_delete_steps("main", &existing(), "hosts/freyr", Some(&contents));
-        assert_eq!(
-            steps[0].target,
-            "main:hosts/freyr#groups=1,snapshots=14@1791000000"
-        );
+        assert_eq!(steps[0].target, "main:hosts/freyr#g1.s14@1791000000");
         let grown = api::NsContents {
             snapshots: 15,
             ..contents
@@ -530,5 +539,58 @@ mod tests {
         let d = task_detail(&m.client(), upid, 0, 0).await.unwrap();
         assert_eq!(d.status.status, "stopped");
         assert_eq!(d.log_total, 3);
+    }
+
+    #[tokio::test]
+    async fn namespace_delete_refuses_when_its_backups_changed() {
+        let m = MockTransport::new();
+        m.on(
+            Method::Get,
+            "/admin/datastore/main/namespace",
+            200,
+            NAMESPACE_LIST,
+        );
+        m.on(
+            Method::Get,
+            "/admin/datastore/main/groups",
+            200,
+            GROUPS_LIST,
+        );
+        m.ok(
+            Method::Delete,
+            "/admin/datastore/main/namespace",
+            Value::Null,
+        );
+        let mut args = NamespaceDeleteArgs {
+            datastore: "main".into(),
+            ns: "hosts/freyr".into(),
+            delete_groups: true,
+            ..Default::default()
+        };
+        let Change::Plan(p) = namespace_delete(&m.client(), &args, None).await.unwrap() else {
+            panic!()
+        };
+        args.items = p.changes.iter().map(|c| c.target.clone()).collect();
+        assert_eq!(
+            args.items,
+            vec!["delete-namespace main:hosts/freyr#g3.s36@1791000000"]
+        );
+        let mut grown: Value = plugin_toolkit::serde_json::from_str(GROUPS_LIST).unwrap();
+        grown["data"][0]["backup-count"] = json!(13);
+        m.on(
+            Method::Get,
+            "/admin/datastore/main/groups",
+            200,
+            &grown.to_string(),
+        );
+        args.execute = true;
+        let err = namespace_delete(&m.client(), &args, Some(&admin()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("changed since the dry run"),
+            "{err}"
+        );
+        assert!(m.mutations().is_empty(), "{:?}", m.mutations());
     }
 }

@@ -1001,6 +1001,110 @@ mod cli_tests {
         check::<crate::endpoint::PbsUpdateArgs>();
     }
 
+    /// `--items` is comma-delimited, so a real plan item from every verb that
+    /// takes items must survive parsing intact.
+    #[test]
+    fn real_plan_items_survive_the_items_flag() {
+        use plugin_toolkit::clap::FromArgMatches;
+
+        fn parse<A: Args + FromArgMatches>(argv: &[&str]) -> A {
+            let m = A::augment_args(Command::new("t"))
+                .try_get_matches_from(std::iter::once("t").chain(argv.iter().copied()))
+                .unwrap();
+            A::from_arg_matches(&m).unwrap()
+        }
+        let ns = crate::tools::namespace_delete_steps(
+            "main",
+            &[crate::api::Namespace {
+                ns: "hosts/freyr".into(),
+                comment: None,
+            }],
+            "hosts/freyr",
+            Some(&crate::api::NsContents {
+                groups: 9,
+                snapshots: 108,
+                last_backup: 1_791_000_000,
+            }),
+        )
+        .0;
+        let ns_items = crate::plan::items(&ns);
+        let groups: Vec<crate::groups::Group> = plugin_toolkit::serde_json::from_value(
+            crate::api::fixtures::data(crate::api::fixtures::GROUPS_LIST),
+        )
+        .unwrap();
+        let ns = Some("hosts/freyr".to_string());
+        let (deletes, _) = crate::groups::group_delete_steps(
+            &[("main".to_string(), groups)],
+            &ns,
+            "vm",
+            "111",
+            false,
+        );
+        let group = crate::plan::items(&deletes).remove(0);
+        let entries: Vec<crate::groups::PruneEntry> = plugin_toolkit::serde_json::from_value(
+            crate::api::fixtures::data(crate::api::fixtures::PRUNE_DRY_RUN),
+        )
+        .unwrap();
+        let prunes = crate::groups::prune_steps(
+            "main",
+            &crate::groups::PruneArgs::default().keep(),
+            &ns,
+            &[(("vm".to_string(), "111".to_string()), entries)],
+        );
+        let prune = crate::plan::items(&prunes).remove(0);
+        let enroll = vec![
+            "create-namespace main:hosts/freyr".to_string(),
+            "regenerate-token token:freyr@pbs!backup".to_string(),
+            "grant-DatastoreBackup acl:freyr@pbs!backup:/datastore/main/hosts/freyr:DatastoreBackup"
+                .to_string(),
+        ];
+        let mut revoke = enroll.clone();
+        revoke.extend(ns_items.clone());
+        for item in ns_items.iter().chain(&enroll).chain([&group, &prune]) {
+            assert!(!item.contains(','), "item carries the delimiter: {item}");
+        }
+
+        let joined = |v: &[String]| v.join(",");
+        let a: crate::tools::NamespaceDeleteArgs = parse(&[
+            "--datastore",
+            "main",
+            "--ns",
+            "hosts/freyr",
+            "--items",
+            &joined(&ns_items),
+        ]);
+        assert_eq!(a.items, ns_items);
+        let a: crate::enroll::HostEnrollArgs = parse(&[
+            "--host",
+            "freyr",
+            "--datastore",
+            "main",
+            "--items",
+            &joined(&enroll),
+        ]);
+        assert_eq!(a.items, enroll);
+        let a: crate::enroll::HostRevokeArgs = parse(&[
+            "--host",
+            "freyr",
+            "--datastore",
+            "main",
+            "--items",
+            &joined(&revoke),
+        ]);
+        assert_eq!(a.items, revoke);
+        let a: crate::groups::GroupDeleteArgs = parse(&[
+            "--backup-type",
+            "vm",
+            "--backup-id",
+            "111",
+            "--items",
+            &group,
+        ]);
+        assert_eq!(a.items, vec![group]);
+        let a: crate::groups::PruneArgs = parse(&["--datastore", "main", "--items", &prune]);
+        assert_eq!(a.items, vec![prune]);
+    }
+
     #[test]
     fn flattened_fields_parse_from_kebab_flags() {
         let cmd = SyncJobUpdateArgs::augment_args(Command::new("t"));
