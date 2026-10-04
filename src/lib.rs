@@ -1,10 +1,20 @@
-//! pbs service backend — Proxmox Backup Server.
+//! pbs plugin — Proxmox Backup Server.
 //!
-//! Implements `ServiceBackend` so the generic `service.*` tools
-//! (deploy/backup/restore/configure/status/connect/sync) drive pbs. No
-//! `#[orca_tool]`s — the only orca dep is `plugin-toolkit`. Modeled on the
-//! nfs StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
+//! Two surfaces: a `ServiceBackend` so the generic `service.*` tools
+//! (deploy/backup/restore/configure/status) drive pbs, and the `pbs.*` verbs
+//! ([`tools`], [`endpoint`]) that manage a running server through its REST API
+//! ([`client`], [`api`]). See orca/docs/PLUGIN-PROGRAM.md.
 #![allow(clippy::disallowed_types)]
+
+pub mod api;
+pub mod client;
+pub mod endpoint;
+pub mod plan;
+pub mod tls;
+pub mod tools;
+
+/// Provider name: the tool domain and the secrets-scope prefix.
+pub const PROVIDER: &str = "pbs";
 
 use plugin_toolkit::service::{
     BoxFuture, Mount, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError,

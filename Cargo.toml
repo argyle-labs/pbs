@@ -16,15 +16,18 @@ crate-type = ["rlib"]
 name = "pbs"
 path = "src/main.rs"
 
-# pbs is a BACKEND-ONLY orca plugin: zero #[orca_tool]s. It registers a
-# ServiceBackend over the orca socket and reaches the whole orca system
-# through plugin-toolkit alone.
+# Registers a ServiceBackend and the `pbs.` tool surface over the orca socket,
+# reaching orca through plugin-toolkit alone.
 [dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+# The one crate outside the toolkit: a custom certificate verifier that pins
+# PBS's self-signed cert by fingerprint, handed to reqwest as a preconfigured
+# rustls config. Same version reqwest already links.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [dev-dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
-tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio    = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 tempfile = "3"
 
 [lints.clippy]

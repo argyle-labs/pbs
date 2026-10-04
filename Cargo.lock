@@ -1897,6 +1897,7 @@ name = "pbs"
 version = "0.1.0"
 dependencies = [
  "plugin-toolkit",
+ "rustls",
  "tempfile",
  "tokio",
 ]

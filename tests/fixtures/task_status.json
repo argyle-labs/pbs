@@ -1,0 +1,1 @@
+{"data":{"upid":"UPID:pbs:000001AB:00002F10:00000004:66FF0000:garbage_collection:main:root@pam:","node":"pbs","pid":427,"pstart":12048,"starttime":1727987712,"endtime":1727988024,"status":"stopped","exitstatus":"OK","type":"garbage_collection","id":"main","user":"root@pam"}}
