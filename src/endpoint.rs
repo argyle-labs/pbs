@@ -155,7 +155,7 @@ fn resolve_ref(reference: &str) -> Result<String> {
     let middle = reference
         .strip_prefix("pbs.")
         .and_then(|r| r.strip_suffix(".staged"));
-    if !middle.is_some_and(|m| validate_name(m).is_ok()) {
+    if middle.is_none_or(|m| validate_name(m).is_err()) {
         bail!("token_secret_ref must be an orca secret named pbs.<name>.staged, got '{reference}'");
     }
     secrets::get(reference)?
