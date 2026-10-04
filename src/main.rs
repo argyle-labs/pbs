@@ -10,7 +10,7 @@ use plugin_toolkit::plugin::Plugin;
 // Force-link the `pbs.` #[orca_tool] modules so their inventory isn't
 // dead-stripped at link time; nothing else in the bin references them.
 #[allow(unused_imports)]
-use pbs::{endpoint as _, tools as _};
+use pbs::{endpoint as _, enroll as _, tools as _};
 
 fn main() -> plugin_toolkit::anyhow::Result<()> {
     Plugin::named("pbs")

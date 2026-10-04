@@ -25,7 +25,7 @@ pub struct PbsEndpoint {
 const SECRET_FIELD: &str = "token_secret";
 const FINGERPRINT_FIELD: &str = "fingerprint";
 
-fn secret_name(endpoint: &str, field: &str) -> String {
+pub(crate) fn secret_name(endpoint: &str, field: &str) -> String {
     secrets::scoped_name(PROVIDER, endpoint, field)
 }
 
@@ -91,6 +91,11 @@ pub fn select(endpoint: Option<&str>) -> Result<EndpointRow> {
 
 /// Resolve an endpoint into a ready client over its first reachable route.
 pub async fn connect(endpoint: Option<&str>) -> Result<PbsClient> {
+    Ok(connect_named(endpoint).await?.1)
+}
+
+/// [`connect`], also returning the resolved endpoint name.
+pub async fn connect_named(endpoint: Option<&str>) -> Result<(String, PbsClient)> {
     let row = select(endpoint)?;
     if !row.enabled {
         bail!("pbs endpoint '{}' is disabled", row.name);
@@ -98,11 +103,8 @@ pub async fn connect(endpoint: Option<&str>) -> Result<PbsClient> {
     let token = token(&row)?;
     let policy = TlsPolicy::from_config(fingerprint(&row.name)?, row.insecure);
     let base = route::resolve_reachable(&row.name, &row.routes, policy.probe_insecure()).await?;
-    Ok(PbsClient::new(
-        &base,
-        token,
-        Box::new(ReqwestTransport::new(&policy)?),
-    ))
+    let client = PbsClient::new(&base, token, Box::new(ReqwestTransport::new(&policy)?));
+    Ok((row.name, client))
 }
 
 #[orca_struct(args)]

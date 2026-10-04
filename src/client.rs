@@ -8,6 +8,7 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use plugin_toolkit::prelude::*;
@@ -196,7 +197,7 @@ pub fn validate_token_id(id: &str) -> Result<()> {
 pub struct PbsClient {
     base: String,
     token: ApiToken,
-    transport: Box<dyn Transport>,
+    transport: Arc<dyn Transport>,
 }
 
 impl fmt::Debug for PbsClient {
@@ -228,7 +229,16 @@ impl PbsClient {
         Self {
             base,
             token,
-            transport,
+            transport: Arc::from(transport),
+        }
+    }
+
+    /// Same server and transport, other credentials.
+    pub fn with_token(&self, token: ApiToken) -> Self {
+        Self {
+            base: self.base.clone(),
+            token,
+            transport: self.transport.clone(),
         }
     }
 
@@ -268,6 +278,16 @@ impl PbsClient {
         self.decode(self.call(Method::Delete, path, query, None).await?)
     }
 
+    /// HTTP status of an authenticated GET; any status is a success here.
+    pub async fn status_of(&self, path: &str) -> Result<u16> {
+        let reply = self
+            .transport
+            .send(self.build(Method::Get, path, &[], None)?)
+            .await
+            .map_err(|e| anyhow!("{}", self.token.redact(&format!("PBS GET {path}: {e:#}"))))?;
+        Ok(reply.status)
+    }
+
     fn decode<T: DeserializeOwned>(&self, env: Envelope) -> Result<T> {
         serde_json::from_value(env.data).map_err(|e| {
             anyhow!(
@@ -277,13 +297,13 @@ impl PbsClient {
         })
     }
 
-    async fn call(
+    fn build(
         &self,
         method: Method,
         path: &str,
         query: &[(&str, String)],
         body: Option<Value>,
-    ) -> Result<Envelope> {
+    ) -> Result<HttpCall> {
         let mut url = format!("{}/api2/json{}", self.base, path);
         if !query.is_empty() {
             url.push('?');
@@ -300,15 +320,25 @@ impl PbsClient {
             }
             None => None,
         };
+        Ok(HttpCall {
+            method,
+            url,
+            headers,
+            body,
+        })
+    }
+
+    async fn call(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<Value>,
+    ) -> Result<Envelope> {
         let what = format!("{} {}", method.as_str(), path);
         let reply = self
             .transport
-            .send(HttpCall {
-                method,
-                url,
-                headers,
-                body,
-            })
+            .send(self.build(method, path, query, body)?)
             .await
             .map_err(|e| anyhow!("{}", self.token.redact(&format!("PBS {what}: {e:#}"))))?;
         parse_reply(&what, reply).map_err(|e| anyhow!("{}", self.token.redact(&format!("{e:#}"))))
