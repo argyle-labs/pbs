@@ -7,7 +7,7 @@
 #![allow(clippy::disallowed_types)]
 
 use plugin_toolkit::service::{
-    BoxFuture, Endpoint, Mount, Runtime, ServiceBackend, ServiceCapability, ServiceError,
+    BoxFuture, Mount, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError,
     ServiceStatus, WorkloadSpec,
 };
 
@@ -42,7 +42,7 @@ fn resolve_image(override_value: Option<String>) -> String {
 }
 
 /// pbs backend. Holds only the provider name; per-instance endpoint/creds
-/// come from the `Endpoint` the generic `service.*` tools hand each op.
+/// come from the instance id and `Routes` the generic `service.*` tools hand each op.
 #[derive(Debug, Clone)]
 pub struct PbsBackend {
     provider: &'static str,
@@ -97,32 +97,25 @@ impl ServiceBackend for PbsBackend {
     fn workload_spec<'a>(
         &'a self,
         runtime: Runtime,
-        ep: &'a Endpoint,
+        instance: &'a str,
+        routes: &'a Routes,
     ) -> BoxFuture<'a, Result<WorkloadSpec, ServiceError>> {
         Box::pin(async move {
             match runtime {
                 Runtime::Docker | Runtime::Podman => Ok(WorkloadSpec {
-                    name: ep.name.clone(),
+                    name: instance.to_string(),
                     image: Some(image_ref()),
                     env: Vec::new(),
                     mounts: vec![
                         // Config + server identity. Named volume rather than a
                         // host path so recreating the container is lossless.
-                        Mount {
-                            source: format!("{}-config", ep.name),
-                            target: "/etc/proxmox-backup".to_string(),
-                            read_only: false,
-                        },
-                        Mount {
-                            source: format!("{}-logs", ep.name),
-                            target: "/var/log/proxmox-backup".to_string(),
-                            read_only: false,
-                        },
+                        Mount::bind(format!("{instance}-config"), "/etc/proxmox-backup"),
+                        Mount::bind(format!("{instance}-logs"), "/var/log/proxmox-backup"),
                     ],
                     // Datastore mounts are deliberately absent: which paths hold
                     // backups is per-install, so they are supplied as endpoint
                     // config and merged by the deploy target, not hardcoded here.
-                    ports: vec![format!("{}:8007", ep.publish_port(8007))],
+                    ports: vec![format!("{}:8007", routes.publish_port(8007))],
                 }),
                 Runtime::Lxc | Runtime::Vm => {
                     Err(ServiceError::unimplemented("pbs.workload_spec (lxc/vm)"))
@@ -133,7 +126,8 @@ impl ServiceBackend for PbsBackend {
 
     fn configure<'a>(
         &'a self,
-        _ep: &'a Endpoint,
+        _instance: &'a str,
+        _routes: &'a Routes,
         _config: &'a str,
     ) -> BoxFuture<'a, Result<(), ServiceError>> {
         // TODO: apply pbs-specific config idempotently.
@@ -142,7 +136,8 @@ impl ServiceBackend for PbsBackend {
 
     fn status<'a>(
         &'a self,
-        _ep: &'a Endpoint,
+        _instance: &'a str,
+        _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<ServiceStatus, ServiceError>> {
         // TODO: real health/diagnostics.
         Box::pin(async move { Err(ServiceError::unimplemented("pbs.status")) })
@@ -167,11 +162,11 @@ mod tests {
     #[tokio::test]
     async fn docker_workload_spec_carries_config_volume_and_port() {
         let b = PbsBackend::new("pbs");
-        let ep = Endpoint {
-            name: "pbs-willow".to_string(),
-            ..Default::default()
-        };
-        let spec = b.workload_spec(Runtime::Docker, &ep).await.unwrap();
+        let routes = Routes::new();
+        let spec = b
+            .workload_spec(Runtime::Docker, "pbs-willow", &routes)
+            .await
+            .unwrap();
 
         assert_eq!(spec.name, "pbs-willow");
         assert_eq!(
@@ -217,8 +212,8 @@ mod tests {
     #[tokio::test]
     async fn lxc_and_vm_remain_unimplemented() {
         let b = PbsBackend::new("pbs");
-        let ep = Endpoint::default();
-        assert!(b.workload_spec(Runtime::Lxc, &ep).await.is_err());
-        assert!(b.workload_spec(Runtime::Vm, &ep).await.is_err());
+        let routes = Routes::new();
+        assert!(b.workload_spec(Runtime::Lxc, "pbs", &routes).await.is_err());
+        assert!(b.workload_spec(Runtime::Vm, "pbs", &routes).await.is_err());
     }
 }
