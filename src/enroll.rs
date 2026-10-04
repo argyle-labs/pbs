@@ -4,6 +4,10 @@
 //! Enrolment is level-triggered: it reads the live state, reports every
 //! deviation from the desired set as a [`Finding`], and plans only the calls
 //! that close the gap. Re-running on an enrolled host is a no-op.
+//!
+//! Execute acts only on the plan items the caller echoes back (`items`), and
+//! the token secret is never returned: it is written to orca's secrets domain
+//! right after PBS mints it, before any later call runs.
 
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::secrets;
@@ -19,6 +23,11 @@ use crate::plan::{self, ApiCall, Change, Step};
 pub const ROLES: [&str; 2] = ["DatastoreBackup", "DatastorePowerUser"];
 const REALM: &str = "pbs";
 const TOKEN_NAME: &str = "backup";
+/// Host names that would collide with an operator or service account.
+const RESERVED: [&str; 3] = ["admin", "root", "orca"];
+/// Prefix of the comment orca puts on users it creates. A user without it was
+/// made by hand and is only taken over with `adopt`.
+pub const MARKER: &str = "orca: backup client for";
 
 /// Everything enrolment derives from `(host, datastore)`.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,12 +65,39 @@ impl Identity {
         e.ugid_type == "user" && self.auth_ids().contains(&e.ugid.as_str())
     }
 
+    /// An enrol role on `/datastore/<any>/hosts/<host>`: a host enrolled into
+    /// several datastores keeps each grant.
+    fn in_scope(&self, e: &AclEntry) -> bool {
+        let tail = format!("/hosts/{}", self.host);
+        let store_ok = e
+            .path
+            .strip_prefix("/datastore/")
+            .and_then(|rest| rest.strip_suffix(&tail))
+            .is_some_and(|store| !store.is_empty() && !store.contains('/'));
+        store_ok && ROLES.contains(&e.roleid.as_str())
+    }
+
     fn token_path(&self) -> String {
         format!("/access/users/{}/token/{TOKEN_NAME}", encode(&self.userid))
     }
 
     fn user_path(&self) -> String {
         format!("/access/users/{}", encode(&self.userid))
+    }
+
+    /// Refuse to act on the account behind the endpoint's own token: enrolling
+    /// or revoking it would rewrite or delete the credential orca manages
+    /// PBS with.
+    fn check_not_self(&self, c: &PbsClient) -> Result<()> {
+        let own_user = c.token_id().split('!').next().unwrap_or_default();
+        if own_user == self.userid {
+            bail!(
+                "host '{}' maps to {}, the user behind this endpoint's own token; refusing",
+                self.host,
+                self.userid
+            );
+        }
+        Ok(())
     }
 }
 
@@ -74,6 +110,9 @@ pub fn validate_host(host: &str) -> Result<()> {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
     if !ok {
         bail!("invalid host '{host}': must match ^[A-Za-z0-9][A-Za-z0-9_-]{{0,31}}$");
+    }
+    if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(host)) {
+        bail!("host name '{host}' is reserved");
     }
     Ok(())
 }
@@ -88,6 +127,21 @@ pub fn validate_datastore(store: &str) -> Result<()> {
 /// Name of the orca secret holding a host's token secret.
 pub fn secret_name(endpoint: &str, host: &str) -> String {
     endpoint::secret_name(endpoint, &format!("host_{host}_token"))
+}
+
+fn is_marked(u: &User) -> bool {
+    u.comment.as_deref().is_some_and(|c| c.starts_with(MARKER))
+}
+
+fn require_managed(id: &Identity, user: Option<&User>, adopt: bool) -> Result<()> {
+    match user {
+        Some(u) if !is_marked(u) && !adopt => bail!(
+            "user {} exists but was not created by orca (its comment lacks '{MARKER}'); \
+             pass adopt: true to take it over",
+            id.userid
+        ),
+        _ => Ok(()),
+    }
 }
 
 #[orca_struct]
@@ -121,16 +175,47 @@ pub struct State {
     pub namespaces: Vec<Namespace>,
     pub users: Vec<User>,
     pub acls: Vec<AclEntry>,
+    pub acl_digest: Option<String>,
     pub secret: SecretState,
     pub now: i64,
 }
 
-fn reactivate() -> Value {
-    json!({ "enable": true, "expire": 0 })
+fn user_target(id: &Identity) -> String {
+    format!("user:{}", id.userid)
 }
 
-/// Drift and the steps that remove it.
-pub fn diff_enroll(id: &Identity, st: &State) -> (Vec<Finding>, Vec<Step>) {
+fn token_target(id: &Identity) -> String {
+    format!("token:{}", id.tokenid)
+}
+
+fn acl_target(auth: &str, path: &str, role: &str) -> String {
+    format!("acl:{auth}:{path}:{role}")
+}
+
+fn acl_put(path: &str, role: &str, auth: &str, delete: bool) -> Value {
+    if delete {
+        json!({ "path": path, "role": role, "auth-id": auth, "delete": true })
+    } else {
+        json!({ "path": path, "role": role, "auth-id": auth, "propagate": true })
+    }
+}
+
+/// Echo the `acl.cfg` digest on the first ACL write only: that write changes
+/// the digest, so later writes would be refused if they carried it too.
+fn stamp_acl_digest(steps: &mut [Step], digest: Option<&str>) {
+    let Some(d) = digest else { return };
+    let first = steps.iter_mut().find_map(|s| match &mut s.call {
+        ApiCall::Put { path, body } if path == "/access/acl" => Some(body),
+        _ => None,
+    });
+    if let Some(body) = first {
+        body["digest"] = json!(d);
+    }
+}
+
+/// Drift and the steps that remove it. Errors if the user exists but is not
+/// orca-managed and `adopt` is not set.
+pub fn diff_enroll(id: &Identity, st: &State, adopt: bool) -> Result<(Vec<Finding>, Vec<Step>)> {
     let mut findings = Vec::new();
     let mut steps = Vec::new();
 
@@ -145,36 +230,48 @@ pub fn diff_enroll(id: &Identity, st: &State) -> (Vec<Finding>, Vec<Step>) {
     }
 
     let user = st.users.iter().find(|u| u.userid == id.userid);
+    require_managed(id, user, adopt)?;
+    let marker = format!("{MARKER} {}", id.host);
     match user {
         None => {
             findings.push(finding("user-missing", &id.userid));
             steps.push(Step::new(
-                &id.userid,
+                user_target(id),
                 "create-user",
                 ApiCall::Post {
                     path: "/access/users".into(),
-                    body: json!({
-                        "userid": id.userid,
-                        "comment": format!("orca: backup client for {}", id.host),
-                    }),
+                    body: json!({ "userid": id.userid, "comment": marker }),
                 },
             ));
         }
-        Some(u) if !api::is_active(u.enable, u.expire, st.now) => {
-            findings.push(finding(
-                "user-inactive",
-                format!("{} is disabled or expired", id.userid),
-            ));
-            steps.push(Step::new(
-                &id.userid,
-                "enable-user",
-                ApiCall::Put {
-                    path: id.user_path(),
-                    body: reactivate(),
-                },
-            ));
+        Some(u) => {
+            let mut body = json!({});
+            if !is_marked(u) {
+                findings.push(finding(
+                    "user-unmanaged",
+                    format!("{} was created by hand; adopting it", id.userid),
+                ));
+                body["comment"] = json!(marker);
+            }
+            if !api::is_active(u.enable, u.expire, st.now) {
+                findings.push(finding(
+                    "user-inactive",
+                    format!("{} is disabled or expired", id.userid),
+                ));
+                body["enable"] = json!(true);
+                body["expire"] = json!(0);
+            }
+            if body.as_object().is_some_and(|o| !o.is_empty()) {
+                steps.push(Step::new(
+                    user_target(id),
+                    "update-user",
+                    ApiCall::Put {
+                        path: id.user_path(),
+                        body,
+                    },
+                ));
+            }
         }
-        Some(_) => {}
     }
 
     let token = user.and_then(|u| u.tokens.iter().find(|t| t.tokenid == id.tokenid));
@@ -183,14 +280,14 @@ pub fn diff_enroll(id: &Identity, st: &State) -> (Vec<Finding>, Vec<Step>) {
             findings.push(finding("token-missing", &id.tokenid));
             steps.push(
                 Step::new(
-                    &id.tokenid,
+                    token_target(id),
                     "create-token",
                     ApiCall::Post {
                         path: id.token_path(),
                         body: json!({ "comment": format!("orca: {} backups", id.host) }),
                     },
                 )
-                .detail("secret is stored in orca, never printed")
+                .detail("secret is stored in orca as soon as PBS returns it, never printed")
                 .sensitive(),
             );
         }
@@ -226,15 +323,18 @@ pub fn diff_enroll(id: &Identity, st: &State) -> (Vec<Finding>, Vec<Step>) {
                 }
                 SecretState::Valid => false,
             };
+            let mut body = json!({});
             if rotate {
-                let mut body = json!({ "regenerate": true });
-                if inactive {
-                    body["enable"] = json!(true);
-                    body["expire"] = json!(0);
-                }
+                body["regenerate"] = json!(true);
+            }
+            if inactive {
+                body["enable"] = json!(true);
+                body["expire"] = json!(0);
+            }
+            if rotate {
                 steps.push(
                     Step::new(
-                        &id.tokenid,
+                        token_target(id),
                         "regenerate-token",
                         ApiCall::Put {
                             path: id.token_path(),
@@ -246,11 +346,11 @@ pub fn diff_enroll(id: &Identity, st: &State) -> (Vec<Finding>, Vec<Step>) {
                 );
             } else if inactive {
                 steps.push(Step::new(
-                    &id.tokenid,
+                    token_target(id),
                     "enable-token",
                     ApiCall::Put {
                         path: id.token_path(),
-                        body: reactivate(),
+                        body,
                     },
                 ));
             }
@@ -274,20 +374,17 @@ pub fn diff_enroll(id: &Identity, st: &State) -> (Vec<Finding>, Vec<Step>) {
                 format!("{role} for {auth} on {}", id.acl_path),
             ));
             steps.push(Step::new(
-                format!("{auth} {}", id.acl_path),
+                acl_target(auth, &id.acl_path, role),
                 format!("grant-{role}"),
                 ApiCall::Put {
                     path: "/access/acl".into(),
-                    body: json!({ "path": id.acl_path, "role": role, "auth-id": auth, "propagate": true }),
+                    body: acl_put(&id.acl_path, role, auth, false),
                 },
             ));
         }
     }
 
-    for e in st.acls.iter().filter(|e| id.owns(e)) {
-        if e.path == id.acl_path && ROLES.contains(&e.roleid.as_str()) {
-            continue;
-        }
+    for e in st.acls.iter().filter(|e| id.owns(e) && !id.in_scope(e)) {
         findings.push(finding(
             "acl-out-of-scope",
             format!("{} for {} on {}", e.roleid, e.ugid, e.path),
@@ -295,33 +392,42 @@ pub fn diff_enroll(id: &Identity, st: &State) -> (Vec<Finding>, Vec<Step>) {
         steps.push(revoke_acl(e));
     }
 
-    (findings, steps)
+    stamp_acl_digest(&mut steps, st.acl_digest.as_deref());
+    Ok((findings, steps))
 }
 
 fn revoke_acl(e: &AclEntry) -> Step {
     Step::new(
-        format!("{} {}", e.ugid, e.path),
+        acl_target(&e.ugid, &e.path, &e.roleid),
         format!("revoke-{}", e.roleid),
         ApiCall::Put {
             path: "/access/acl".into(),
-            body: json!({ "path": e.path, "role": e.roleid, "auth-id": e.ugid, "delete": true }),
+            body: acl_put(&e.path, &e.roleid, &e.ugid, true),
         },
     )
 }
 
-/// Steps that remove the host's access, and its data only if asked.
-pub fn diff_revoke(id: &Identity, st: &State, delete_data: bool) -> (Vec<Step>, Vec<String>) {
+/// Steps that remove the host's access, and its data only if asked. Errors if
+/// the user exists but is not orca-managed and `adopt` is not set.
+pub fn diff_revoke(
+    id: &Identity,
+    st: &State,
+    delete_data: bool,
+    adopt: bool,
+) -> Result<(Vec<Step>, Vec<String>)> {
+    let user = st.users.iter().find(|u| u.userid == id.userid);
+    require_managed(id, user, adopt)?;
     let mut steps: Vec<Step> = st
         .acls
         .iter()
         .filter(|e| id.owns(e))
         .map(revoke_acl)
         .collect();
+    stamp_acl_digest(&mut steps, st.acl_digest.as_deref());
     let mut notes = Vec::new();
-    let user = st.users.iter().find(|u| u.userid == id.userid);
     if user.is_some_and(|u| u.tokens.iter().any(|t| t.tokenid == id.tokenid)) {
         steps.push(Step::new(
-            &id.tokenid,
+            token_target(id),
             "delete-token",
             ApiCall::Delete {
                 path: id.token_path(),
@@ -331,7 +437,7 @@ pub fn diff_revoke(id: &Identity, st: &State, delete_data: bool) -> (Vec<Step>, 
     }
     if user.is_some() {
         steps.push(Step::new(
-            &id.userid,
+            user_target(id),
             "delete-user",
             ApiCall::Delete {
                 path: id.user_path(),
@@ -352,7 +458,7 @@ pub fn diff_revoke(id: &Identity, st: &State, delete_data: bool) -> (Vec<Step>, 
         )),
         (false, _) => {}
     }
-    (steps, notes)
+    Ok((steps, notes))
 }
 
 async fn check_secret(c: &PbsClient, tokenid: &str, stored: Option<String>) -> SecretState {
@@ -370,27 +476,23 @@ async fn check_secret(c: &PbsClient, tokenid: &str, stored: Option<String>) -> S
 }
 
 async fn read_state(c: &PbsClient, id: &Identity, stored: Option<String>) -> Result<State> {
+    let (acls, acl_digest) = api::acls_with_digest(c).await?;
     Ok(State {
         namespaces: api::namespaces(c, &id.datastore).await?,
         users: api::users(c).await?,
-        acls: api::acls(c).await?,
+        acls,
+        acl_digest,
         secret: check_secret(c, &id.tokenid, stored).await,
         now: plugin_toolkit::time::now().unix_seconds(),
     })
 }
 
 /// The minted secret from a create (`value`) or regenerate (`secret`) reply.
-fn minted_secret(steps: &[Step], results: &[Value]) -> Option<String> {
-    steps
-        .iter()
-        .zip(results)
-        .filter(|(s, _)| s.sensitive_result)
-        .find_map(|(_, r)| {
-            r.get("value")
-                .or_else(|| r.get("secret"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+fn minted_secret(reply: &Value) -> Option<&str> {
+    reply
+        .get("value")
+        .or_else(|| reply.get("secret"))
+        .and_then(Value::as_str)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -403,29 +505,29 @@ pub struct HostEnrollArgs {
     #[arg(long)]
     #[serde(default)]
     pub endpoint: Option<String>,
-    /// Backup client host name (e.g. `freyr`).
+    /// Backup client host name (e.g. `freyr`). `admin`, `root` and `orca` are
+    /// reserved.
     #[arg(long)]
     pub host: String,
     /// Datastore the host backs up into.
     #[arg(long)]
     pub datastore: String,
+    /// Take over an existing `<host>@pbs` user orca did not create.
+    #[arg(long)]
+    #[serde(default)]
+    pub adopt: bool,
+    /// The dry run's change targets to apply (execute only). Comma-separated
+    /// on the CLI.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default)]
+    pub items: Vec<String>,
     #[arg(long)]
     #[serde(default)]
     pub execute: bool,
 }
 
-/// A secret returned because orca could not store it. Shown once.
 #[orca_struct]
-#[derive(Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct SensitiveSecret {
-    pub sensitive: bool,
-    pub token_id: String,
-    pub value: String,
-    pub note: String,
-}
-
-#[orca_struct]
+#[derive(Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct HostEnrollOutput {
     pub host: String,
@@ -440,13 +542,12 @@ pub struct HostEnrollOutput {
     /// orca secret holding the token secret, once one has been stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_secret: Option<SensitiveSecret>,
 }
 
 /// Enrol a backup client host: namespace `hosts/<host>`, user `<host>@pbs`,
 /// token `<host>@pbs!backup`, and DatastoreBackup + DatastorePowerUser on
 /// `/datastore/<ds>/hosts/<host>` only. Reports drift; dry-run by default.
+/// Execute applies only the `items` echoed from the dry run.
 #[orca_tool(
     domain = "pbs",
     verb = "host.enroll",
@@ -467,11 +568,12 @@ async fn enroll(
     caller: Option<&plugin_toolkit::contract::CallerIdentity>,
 ) -> Result<HostEnrollOutput> {
     const TOOL: &str = "pbs.host.enroll";
+    id.check_not_self(c)?;
     let sname = secret_name(ep, &id.host);
     let stored = secrets::get(&sname)?.filter(|s| !s.is_empty());
     let held = stored.is_some();
     let st = read_state(c, id, stored).await?;
-    let (findings, steps) = diff_enroll(id, &st);
+    let (findings, steps) = diff_enroll(id, &st, args.adopt)?;
     let summary = format!("enrol {} on {}:{}", id.host, id.datastore, id.ns);
     let mut out = HostEnrollOutput {
         host: id.host.clone(),
@@ -483,31 +585,33 @@ async fn enroll(
         findings,
         change: Change::Plan(plan::plan(TOOL, args, summary.clone(), &steps, &[])?),
         secret_ref: held.then(|| sname.clone()),
-        token_secret: None,
     };
     if !args.execute {
         return Ok(out);
     }
     plan::authorize_execute(TOOL, caller)?;
-    let results = plan::run(TOOL, c, &steps).await?;
-    let mut notes = Vec::new();
-    if let Some(secret) = minted_secret(&steps, &results) {
-        let desc = format!("PBS token {} (pbs endpoint '{ep}')", id.tokenid);
-        match secrets::set(&sname, &secret, Some(&desc)) {
-            Ok(_) => out.secret_ref = Some(sname),
-            Err(e) => {
-                notes.push(format!("could not store the token secret in orca: {e:#}"));
-                out.secret_ref = None;
-                out.token_secret = Some(SensitiveSecret {
-                    sensitive: true,
-                    token_id: id.tokenid.clone(),
-                    value: secret,
-                    note: "orca could not store this secret and PBS will not show it again; \
-                           save it now or re-run enroll to regenerate"
-                        .into(),
-                });
-            }
+    let (steps, notes) = plan::confirm(TOOL, steps, &args.items)?;
+    let desc = format!("PBS token {} (pbs endpoint '{ep}')", id.tokenid);
+    let mut stored_now = false;
+    let results = plan::run_with(TOOL, c, &steps, |step, reply| {
+        if !step.sensitive_result {
+            return Ok(());
         }
+        let secret = minted_secret(reply)
+            .ok_or_else(|| anyhow!("PBS returned no secret for {}", id.tokenid))?;
+        secrets::set(&sname, secret, Some(&desc)).map_err(|e| {
+            anyhow!(
+                "token secret for {} was minted but not stored ({e:#}); fix the secret backend \
+                 and re-run, which regenerates it",
+                id.tokenid
+            )
+        })?;
+        stored_now = true;
+        Ok(())
+    })
+    .await?;
+    if stored_now {
+        out.secret_ref = Some(sname);
     }
     out.change = Change::Applied(plan::applied(TOOL, summary, &steps, &results, notes));
     Ok(out)
@@ -531,6 +635,15 @@ pub struct HostRevokeArgs {
     #[arg(long)]
     #[serde(default)]
     pub delete_data: bool,
+    /// Revoke a `<host>@pbs` user orca did not create.
+    #[arg(long)]
+    #[serde(default)]
+    pub adopt: bool,
+    /// The dry run's change targets to apply (execute only). Comma-separated
+    /// on the CLI.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default)]
+    pub items: Vec<String>,
     #[arg(long)]
     #[serde(default)]
     pub execute: bool,
@@ -546,7 +659,8 @@ pub struct HostRevokeOutput {
 }
 
 /// Revoke a host: its ACLs (on any path), token and user. Backups are kept
-/// unless `delete_data`. Dry-run by default.
+/// unless `delete_data`. Dry-run by default; execute applies only the `items`
+/// echoed from the dry run.
 #[orca_tool(
     domain = "pbs",
     verb = "host.revoke",
@@ -567,19 +681,28 @@ async fn revoke(
     caller: Option<&plugin_toolkit::contract::CallerIdentity>,
 ) -> Result<HostRevokeOutput> {
     const TOOL: &str = "pbs.host.revoke";
+    id.check_not_self(c)?;
+    let (acls, acl_digest) = api::acls_with_digest(c).await?;
     let st = State {
         namespaces: api::namespaces(c, &id.datastore).await?,
         users: api::users(c).await?,
-        acls: api::acls(c).await?,
+        acls,
+        acl_digest,
         secret: SecretState::Unknown,
         now: 0,
     };
-    let (steps, mut notes) = diff_revoke(id, &st, args.delete_data);
+    let token_exists = st
+        .users
+        .iter()
+        .any(|u| u.tokens.iter().any(|t| t.tokenid == id.tokenid));
+    let (steps, mut notes) = diff_revoke(id, &st, args.delete_data, args.adopt)?;
     let sname = secret_name(ep, &id.host);
     let summary = format!("revoke {} on {}", id.host, id.datastore);
     if !args.execute {
         if secrets::exists(&sname)? {
-            notes.push(format!("orca secret {sname} would be removed"));
+            notes.push(format!(
+                "orca secret {sname} is removed once the token is gone"
+            ));
         }
         return Ok(HostRevokeOutput {
             host: id.host.clone(),
@@ -588,8 +711,11 @@ async fn revoke(
         });
     }
     plan::authorize_execute(TOOL, caller)?;
+    let (steps, dropped) = plan::confirm(TOOL, steps, &args.items)?;
+    notes.extend(dropped);
     let results = plan::run(TOOL, c, &steps).await?;
-    let secret_removed = secrets::delete(&sname)?;
+    let token_gone = !token_exists || steps.iter().any(|s| s.action == "delete-token");
+    let secret_removed = token_gone && secrets::delete(&sname)?;
     Ok(HostRevokeOutput {
         host: id.host.clone(),
         change: Change::Applied(plan::applied(TOOL, summary, &steps, &results, notes)),
@@ -609,13 +735,16 @@ mod tests {
     use crate::client::mock::MockTransport;
     use crate::client::Method;
     use crate::endpoint::test_store::{with_store, Store};
-    use crate::plan::admin;
+    use crate::plan::{admin, items};
+
+    const DIGEST: &str = "3f1a9c0b7e2d4a5f6b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c";
 
     fn state(secret: SecretState) -> State {
         State {
             namespaces: serde_json::from_value(data(NAMESPACE_LIST)).unwrap(),
             users: serde_json::from_value(data(USERS_LIST)).unwrap(),
             acls: serde_json::from_value(data(ACL_LIST)).unwrap(),
+            acl_digest: Some(DIGEST.into()),
             secret,
             now: 1_759_600_000,
         }
@@ -623,6 +752,10 @@ mod tests {
 
     fn kinds(f: &[Finding]) -> Vec<&str> {
         f.iter().map(|f| f.kind.as_str()).collect()
+    }
+
+    fn actions(steps: &[Step]) -> Vec<&str> {
+        steps.iter().map(|s| s.action.as_str()).collect()
     }
 
     #[test]
@@ -638,9 +771,36 @@ mod tests {
     }
 
     #[test]
+    fn reserved_names_are_refused() {
+        for h in ["admin", "root", "orca", "Root"] {
+            let err = Identity::new(h, "main").unwrap_err().to_string();
+            assert!(err.contains("reserved"), "{h}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_endpoints_own_user_is_refused() {
+        let m = MockTransport::new();
+        let own = PbsClient::new(
+            "https://pbs.test:8007",
+            ApiToken::new("freyr@pbs!admin", "x").unwrap(),
+            Box::new(m.clone()),
+        );
+        let err = Identity::new("freyr", "main")
+            .unwrap()
+            .check_not_self(&own)
+            .unwrap_err();
+        assert!(err.to_string().contains("own token"), "{err}");
+        assert!(Identity::new("freyr", "main")
+            .unwrap()
+            .check_not_self(&m.client())
+            .is_ok());
+    }
+
+    #[test]
     fn fresh_host_gets_everything_in_dependency_order() {
         let id = Identity::new("willow", "main").unwrap();
-        let (f, steps) = diff_enroll(&id, &state(SecretState::Missing));
+        let (f, steps) = diff_enroll(&id, &state(SecretState::Missing), false).unwrap();
         assert_eq!(
             kinds(&f),
             vec![
@@ -653,9 +813,8 @@ mod tests {
                 "acl-missing"
             ]
         );
-        let actions: Vec<&str> = steps.iter().map(|s| s.action.as_str()).collect();
         assert_eq!(
-            actions,
+            actions(&steps),
             vec![
                 "create-namespace",
                 "create-user",
@@ -668,6 +827,17 @@ mod tests {
         );
         assert!(steps[2].sensitive_result);
         assert_eq!(
+            steps[1].call,
+            ApiCall::Post {
+                path: "/access/users".into(),
+                body: json!({"userid": "willow@pbs", "comment": "orca: backup client for willow"}),
+            }
+        );
+        let ApiCall::Put { body, .. } = &steps[3].call else {
+            panic!()
+        };
+        assert_eq!(body["digest"], DIGEST, "first ACL write carries the digest");
+        assert_eq!(
             steps[6].call,
             ApiCall::Put {
                 path: "/access/acl".into(),
@@ -679,12 +849,17 @@ mod tests {
                 }),
             }
         );
+        let targets = items(&steps);
+        let mut unique = targets.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), targets.len(), "plan items must be unique");
     }
 
     #[test]
     fn enrolled_host_reports_only_out_of_scope_acl() {
         let id = Identity::new("freyr", "main").unwrap();
-        let (f, steps) = diff_enroll(&id, &state(SecretState::Valid));
+        let (f, steps) = diff_enroll(&id, &state(SecretState::Valid), false).unwrap();
         assert_eq!(kinds(&f), vec!["acl-out-of-scope"]);
         assert_eq!(steps.len(), 1);
         assert_eq!(
@@ -695,16 +870,78 @@ mod tests {
                     "path": "/datastore/main",
                     "role": "DatastoreAdmin",
                     "auth-id": "freyr@pbs!backup",
-                    "delete": true
+                    "delete": true,
+                    "digest": DIGEST
                 }),
             }
         );
     }
 
     #[test]
+    fn enrol_roles_on_another_datastore_stay_in_scope() {
+        let id = Identity::new("freyr", "main").unwrap();
+        let mut st = state(SecretState::Valid);
+        for (path, role) in [
+            ("/datastore/archive/hosts/freyr", "DatastoreBackup"),
+            ("/datastore/archive/hosts/freyr", "DatastorePowerUser"),
+            ("/datastore/archive/hosts/freyr", "DatastoreAdmin"),
+            ("/datastore/a/b/hosts/freyr", "DatastoreBackup"),
+        ] {
+            st.acls.push(AclEntry {
+                path: path.into(),
+                ugid: "freyr@pbs".into(),
+                ugid_type: "user".into(),
+                roleid: role.into(),
+                propagate: true,
+            });
+        }
+        let (f, _) = diff_enroll(&id, &st, false).unwrap();
+        let strays: Vec<&str> = f
+            .iter()
+            .filter(|f| f.kind == "acl-out-of-scope")
+            .map(|f| f.detail.as_str())
+            .collect();
+        assert_eq!(
+            strays,
+            vec![
+                "DatastoreAdmin for freyr@pbs!backup on /datastore/main",
+                "DatastoreAdmin for freyr@pbs on /datastore/archive/hosts/freyr",
+                "DatastoreBackup for freyr@pbs on /datastore/a/b/hosts/freyr"
+            ]
+        );
+    }
+
+    #[test]
+    fn hand_made_user_needs_adopt_and_is_then_marked() {
+        let id = Identity::new("baldur", "main").unwrap();
+        let err = diff_enroll(&id, &state(SecretState::Missing), false).unwrap_err();
+        assert!(err.to_string().contains("adopt"), "{err}");
+        let (f, steps) = diff_enroll(&id, &state(SecretState::Missing), true).unwrap();
+        assert_eq!(
+            kinds(&f),
+            vec![
+                "user-unmanaged",
+                "token-missing",
+                "acl-missing",
+                "acl-missing",
+                "acl-missing"
+            ]
+        );
+        assert_eq!(
+            steps[0].call,
+            ApiCall::Put {
+                path: "/access/users/baldur%40pbs".into(),
+                body: json!({"comment": "orca: backup client for baldur"}),
+            }
+        );
+        assert!(diff_revoke(&id, &state(SecretState::Unknown), false, false).is_err());
+        assert!(diff_revoke(&id, &state(SecretState::Unknown), false, true).is_ok());
+    }
+
+    #[test]
     fn rejected_secret_regenerates_the_token() {
         let id = Identity::new("freyr", "main").unwrap();
-        let (f, steps) = diff_enroll(&id, &state(SecretState::Rejected));
+        let (f, steps) = diff_enroll(&id, &state(SecretState::Rejected), false).unwrap();
         assert!(kinds(&f).contains(&"token-rotated"));
         let regen = steps
             .iter()
@@ -718,23 +955,9 @@ mod tests {
                 body: json!({"regenerate": true}),
             }
         );
-        let (f, steps) = diff_enroll(&id, &state(SecretState::Unknown));
+        let (f, steps) = diff_enroll(&id, &state(SecretState::Unknown), false).unwrap();
         assert!(kinds(&f).contains(&"secret-unverified"));
         assert!(!steps.iter().any(|s| s.action == "regenerate-token"));
-    }
-
-    #[test]
-    fn partial_host_gets_missing_token_and_acls_only() {
-        let id = Identity::new("baldur", "main").unwrap();
-        let (f, steps) = diff_enroll(&id, &state(SecretState::Missing));
-        assert_eq!(
-            kinds(&f),
-            vec!["token-missing", "acl-missing", "acl-missing", "acl-missing"]
-        );
-        assert_eq!(steps[0].action, "create-token");
-        assert!(!steps
-            .iter()
-            .any(|s| s.target.contains("baldur@pbs /") && s.action == "grant-DatastoreBackup"));
     }
 
     #[test]
@@ -742,7 +965,7 @@ mod tests {
         let id = Identity::new("freyr", "main").unwrap();
         let mut st = state(SecretState::Valid);
         st.users[1].tokens[0].expire = Some(1);
-        let (f, steps) = diff_enroll(&id, &st);
+        let (f, steps) = diff_enroll(&id, &st, false).unwrap();
         assert!(kinds(&f).contains(&"token-inactive"));
         let s = steps.iter().find(|s| s.action == "enable-token").unwrap();
         assert_eq!(
@@ -757,10 +980,9 @@ mod tests {
     #[test]
     fn revoke_keeps_data_unless_asked() {
         let id = Identity::new("freyr", "main").unwrap();
-        let (steps, notes) = diff_revoke(&id, &state(SecretState::Unknown), false);
-        let actions: Vec<&str> = steps.iter().map(|s| s.action.as_str()).collect();
+        let (steps, notes) = diff_revoke(&id, &state(SecretState::Unknown), false, false).unwrap();
         assert_eq!(
-            actions,
+            actions(&steps),
             vec![
                 "revoke-DatastoreBackup",
                 "revoke-DatastorePowerUser",
@@ -772,7 +994,7 @@ mod tests {
             ]
         );
         assert!(notes[0].contains("are kept"));
-        let (steps, notes) = diff_revoke(&id, &state(SecretState::Unknown), true);
+        let (steps, notes) = diff_revoke(&id, &state(SecretState::Unknown), true, false).unwrap();
         assert_eq!(steps.last().unwrap().action, "delete-namespace");
         assert!(notes.is_empty());
     }
@@ -805,11 +1027,13 @@ mod tests {
         m
     }
 
-    fn enroll_args(host: &str, execute: bool) -> HostEnrollArgs {
+    fn enroll_args(host: &str, execute: bool, items: Vec<String>) -> HostEnrollArgs {
         HostEnrollArgs {
             endpoint: None,
             host: host.into(),
             datastore: "main".into(),
+            adopt: false,
+            items,
             execute,
         }
     }
@@ -817,12 +1041,10 @@ mod tests {
     fn run_enroll(
         store: &Rc<RefCell<Store>>,
         m: &MockTransport,
-        host: &str,
-        execute: bool,
+        args: HostEnrollArgs,
     ) -> Result<HostEnrollOutput> {
-        let id = Identity::new(host, "main").unwrap();
+        let id = Identity::new(&args.host, "main").unwrap();
         let c = m.client();
-        let args = enroll_args(host, execute);
         let admin = admin();
         with_store(store, || {
             crate::endpoint::test_store::rt().block_on(enroll(
@@ -835,11 +1057,25 @@ mod tests {
         })
     }
 
+    /// Dry run, then execute echoing every planned item.
+    fn plan_then_execute(
+        store: &Rc<RefCell<Store>>,
+        m: &MockTransport,
+        host: &str,
+    ) -> Result<HostEnrollOutput> {
+        let dry = run_enroll(store, m, enroll_args(host, false, vec![]))?;
+        let Change::Plan(p) = dry.change else {
+            panic!("expected plan")
+        };
+        let items = p.changes.iter().map(|c| c.target.clone()).collect();
+        run_enroll(store, m, enroll_args(host, true, items))
+    }
+
     #[test]
     fn dry_run_reads_but_never_writes() {
         let store = Rc::new(RefCell::new(Store::default()));
         let m = enroll_mock();
-        let out = run_enroll(&store, &m, "willow", false).unwrap();
+        let out = run_enroll(&store, &m, enroll_args("willow", false, vec![])).unwrap();
         assert!(matches!(out.change, Change::Plan(_)));
         assert!(m.mutations().is_empty(), "{:?}", m.mutations());
         assert!(store.borrow().secrets.is_empty());
@@ -847,10 +1083,32 @@ mod tests {
     }
 
     #[test]
+    fn execute_without_items_changes_nothing() {
+        let store = Rc::new(RefCell::new(Store::default()));
+        let m = enroll_mock();
+        let err = run_enroll(&store, &m, enroll_args("willow", true, vec![])).unwrap_err();
+        assert!(err.to_string().contains("needs the items"), "{err}");
+        assert!(m.mutations().is_empty());
+    }
+
+    #[test]
+    fn execute_applies_only_confirmed_items() {
+        let store = Rc::new(RefCell::new(Store::default()));
+        let m = enroll_mock();
+        let items = vec!["main:hosts/willow".to_string(), "acl:gone".to_string()];
+        let out = run_enroll(&store, &m, enroll_args("willow", true, items)).unwrap();
+        assert_eq!(m.mutations(), vec!["POST /admin/datastore/main/namespace"]);
+        let Change::Applied(a) = out.change else {
+            panic!()
+        };
+        assert_eq!(a.notes, vec!["skipped acl:gone: no longer planned"]);
+    }
+
+    #[test]
     fn execute_stores_the_minted_secret_and_never_returns_it() {
         let store = Rc::new(RefCell::new(Store::default()));
         let m = enroll_mock();
-        let out = run_enroll(&store, &m, "willow", true).unwrap();
+        let out = plan_then_execute(&store, &m, "willow").unwrap();
         let minted = "0f6e2c1a-5d1b-4e7a-9c3e-2b8d7a6f1e00";
         assert_eq!(
             store
@@ -864,24 +1122,28 @@ mod tests {
             out.secret_ref.as_deref(),
             Some("pbs.willow-pbs.host_willow_token")
         );
-        assert!(out.token_secret.is_none());
         let json = serde_json::to_string(&out).unwrap();
         assert!(!json.contains(minted), "secret leaked into output");
         assert_eq!(m.mutations().len(), 7);
     }
 
     #[test]
-    fn execute_returns_secret_once_when_orca_cannot_store_it() {
+    fn unstorable_secret_stops_before_the_acls_and_is_never_returned() {
         let store = Rc::new(RefCell::new(Store {
             fail_secret_set: true,
             ..Default::default()
         }));
         let m = enroll_mock();
-        let out = run_enroll(&store, &m, "willow", true).unwrap();
-        let s = out.token_secret.expect("secret handed back");
-        assert!(s.sensitive);
-        assert_eq!(s.value, "0f6e2c1a-5d1b-4e7a-9c3e-2b8d7a6f1e00");
-        assert!(out.secret_ref.is_none());
+        let err = plan_then_execute(&store, &m, "willow")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("minted but not stored"), "{err}");
+        assert!(err.contains("re-run"), "{err}");
+        assert!(!err.contains("0f6e2c1a"), "secret leaked into error: {err}");
+        assert!(
+            !m.mutations().iter().any(|l| l.contains("/access/acl")),
+            "no step may run after the secret failed to persist"
+        );
     }
 
     #[test]
@@ -898,7 +1160,7 @@ mod tests {
             401,
             r#"{"data":null,"message":"authentication failed"}"#,
         );
-        let out = run_enroll(&store, &m, "freyr", true).unwrap();
+        let out = plan_then_execute(&store, &m, "freyr").unwrap();
         assert!(out.findings.iter().any(|f| f.kind == "token-rotated"));
         assert_eq!(
             store.borrow().secrets["pbs.willow-pbs.host_freyr_token"],
@@ -917,7 +1179,7 @@ mod tests {
         );
         let m = enroll_mock();
         m.ok(Method::Get, "/version", json!({"version": "4.2"}));
-        let out = run_enroll(&store, &m, "freyr", false).unwrap();
+        let out = run_enroll(&store, &m, enroll_args("freyr", false, vec![])).unwrap();
         assert_eq!(kinds(&out.findings), vec!["acl-out-of-scope"]);
         let probe = m
             .calls
@@ -936,20 +1198,12 @@ mod tests {
         assert_eq!(auth, "PBSAPIToken=freyr@pbs!backup:good-secret");
     }
 
-    #[test]
-    fn revoke_execute_removes_access_and_orca_secret() {
-        let store = Rc::new(RefCell::new(Store::default()));
-        store
-            .borrow_mut()
-            .secrets
-            .insert("pbs.willow-pbs.host_freyr_token".into(), "s".into());
-        let m = enroll_mock();
-        m.ok(
-            Method::Delete,
-            "/access/users/freyr%40pbs/token/backup",
-            Value::Null,
-        );
-        m.ok(Method::Delete, "/access/users/freyr%40pbs", Value::Null);
+    fn run_revoke(
+        store: &Rc<RefCell<Store>>,
+        m: &MockTransport,
+        items: Vec<String>,
+        execute: bool,
+    ) -> Result<HostRevokeOutput> {
         let id = Identity::new("freyr", "main").unwrap();
         let c = m.client();
         let args = HostRevokeArgs {
@@ -957,10 +1211,12 @@ mod tests {
             host: "freyr".into(),
             datastore: "main".into(),
             delete_data: false,
-            execute: true,
+            adopt: false,
+            items,
+            execute,
         };
         let admin = admin();
-        let out = with_store(&store, || {
+        with_store(store, || {
             crate::endpoint::test_store::rt().block_on(revoke(
                 "willow-pbs",
                 &c,
@@ -969,9 +1225,52 @@ mod tests {
                 Some(&admin),
             ))
         })
-        .unwrap();
+    }
+
+    fn revoke_mock() -> MockTransport {
+        let m = enroll_mock();
+        m.ok(
+            Method::Delete,
+            "/access/users/freyr%40pbs/token/backup",
+            Value::Null,
+        );
+        m.ok(Method::Delete, "/access/users/freyr%40pbs", Value::Null);
+        m
+    }
+
+    #[test]
+    fn revoke_execute_removes_confirmed_access_and_orca_secret() {
+        let store = Rc::new(RefCell::new(Store::default()));
+        store
+            .borrow_mut()
+            .secrets
+            .insert("pbs.willow-pbs.host_freyr_token".into(), "s".into());
+        let m = revoke_mock();
+        let Change::Plan(p) = run_revoke(&store, &m, vec![], false).unwrap().change else {
+            panic!()
+        };
+        let items = p.changes.iter().map(|c| c.target.clone()).collect();
+        let out = run_revoke(&store, &m, items, true).unwrap();
         assert!(out.secret_removed);
         assert!(!m.mutations().iter().any(|l| l.contains("namespace")));
         assert_eq!(m.mutations().len(), 7);
+    }
+
+    #[test]
+    fn revoke_keeps_the_secret_when_the_token_was_not_confirmed() {
+        let store = Rc::new(RefCell::new(Store::default()));
+        store
+            .borrow_mut()
+            .secrets
+            .insert("pbs.willow-pbs.host_freyr_token".into(), "s".into());
+        let m = revoke_mock();
+        let items = vec!["acl:freyr@pbs!backup:/datastore/main:DatastoreAdmin".to_string()];
+        let out = run_revoke(&store, &m, items, true).unwrap();
+        assert!(!out.secret_removed);
+        assert_eq!(m.mutations(), vec!["PUT /access/acl"]);
+        assert!(store
+            .borrow()
+            .secrets
+            .contains_key("pbs.willow-pbs.host_freyr_token"));
     }
 }

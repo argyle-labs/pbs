@@ -234,7 +234,21 @@ pub async fn users(c: &PbsClient) -> Result<Vec<User>> {
 }
 
 pub async fn acls(c: &PbsClient) -> Result<Vec<AclEntry>> {
-    c.get("/access/acl", &[]).await
+    Ok(acls_with_digest(c).await?.0)
+}
+
+/// ACL entries plus the `acl.cfg` digest, which an ACL write can echo back
+/// so PBS refuses it if the file changed since this read.
+pub async fn acls_with_digest(c: &PbsClient) -> Result<(Vec<AclEntry>, Option<String>)> {
+    let env = c.get_envelope("/access/acl", &[]).await?;
+    let entries =
+        plugin_toolkit::serde_json::from_value(env.data).context("decode PBS ACL list")?;
+    let digest = env
+        .extra
+        .get("digest")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok((entries, digest))
 }
 
 fn store_path(store: &str, rest: &str) -> String {

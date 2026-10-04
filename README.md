@@ -69,13 +69,15 @@ See [proxmox-backup-restore.md](docs/proxmox-backup-restore.md) for worked opera
 
 `service.*` deploys and backs up pbs itself. Managing a running server goes through the `pbs.*` verbs, which call the PBS REST API on `:8007` with an API token:
 
-- `pbs.create|update|delete|list|detail` — register an endpoint: routes, token id (`user@realm!tokenid`), and either a certificate fingerprint pin or an explicit `insecure`. The token secret and the pin are kept in orca's secrets domain (`pbs.<endpoint>.token_secret`, `pbs.<endpoint>.fingerprint`), never on the endpoint row.
+- `pbs.create|update|delete|list|detail` — register an endpoint: routes, token id (`user@realm!tokenid`), and either a certificate fingerprint pin or an explicit `insecure`. The token secret is passed by reference, never as a value: write it first with `orca secrets upsert --name <ref> --value-stdin`, then pass `token_secret_ref: <ref>`. The secret and the pin are kept in orca's secrets domain (`pbs.<endpoint>.token_secret`, `pbs.<endpoint>.fingerprint`), never on the endpoint row.
 - `pbs.datastore.list|detail` — datastores, usage, group/snapshot counts, GC state.
 - `pbs.namespace.list|create|delete`
 - `pbs.task.list|detail` — tasks and their logs, read through the API.
-- `pbs.host.enroll|revoke` — per backup client host: namespace `hosts/<host>`, user `<host>@pbs`, token `<host>@pbs!backup`, and `DatastoreBackup` + `DatastorePowerUser` on `/datastore/<ds>/hosts/<host>` only (PowerUser lets the host prune its own group). Enrol reports drift (missing pieces, out-of-scope ACLs, a token whose stored secret PBS now rejects) and fixes it on execute. The minted secret is stored as orca secret `pbs.<endpoint>.host_<host>_token` and is never printed. Revoke keeps the namespace and its backups unless `delete_data` is set.
+- `pbs.host.enroll|revoke` — per backup client host: namespace `hosts/<host>`, user `<host>@pbs`, token `<host>@pbs!backup`, and `DatastoreBackup` + `DatastorePowerUser` on `/datastore/<ds>/hosts/<host>` only (PowerUser lets the host prune its own group). Enrol reports drift (missing pieces, out-of-scope ACLs, a token whose stored secret PBS now rejects) and fixes it on execute. The minted secret is stored as orca secret `pbs.<endpoint>.host_<host>_token` the moment PBS returns it and is never printed. If it can't be stored, enrol stops before any later step; re-running regenerates it. The names `admin`, `root` and `orca` are reserved, the user behind the endpoint's own token is refused, and an existing `<host>@pbs` user orca did not create is only taken over with `adopt: true`. Revoke keeps the namespace and its backups unless `delete_data` is set.
 
-Every verb that changes PBS is a dry run unless called with `execute: true`, and executing needs an admin caller.
+Every verb that changes PBS is a dry run unless called with `execute: true`, and executing needs an admin caller. `pbs.host.enroll`, `pbs.host.revoke` and `pbs.namespace.delete` also need `items`: the change targets from the dry run. Execute acts only on those that are still planned and reports the rest as skipped.
+
+**Known gap ([orca#763](https://gitea.scottkey.me/argyle-labs/orca/issues/763)):** orca does not yet pass the caller identity to plugins, so `execute` currently always fails with "no caller identity". The check fails closed on purpose; dry runs work.
 
 ## Layout
 

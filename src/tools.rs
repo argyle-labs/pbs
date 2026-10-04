@@ -192,6 +192,7 @@ pub async fn pbs_namespace_create(args: NamespaceCreateArgs, ctx: &ToolCtx) -> R
         summary,
         steps,
         vec![],
+        None,
     )
     .await
 }
@@ -211,6 +212,11 @@ pub struct NamespaceDeleteArgs {
     #[arg(long)]
     #[serde(default)]
     pub delete_groups: bool,
+    /// The dry run's change targets to apply (execute only). Comma-separated
+    /// on the CLI.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default)]
+    pub items: Vec<String>,
     #[arg(long)]
     #[serde(default)]
     pub execute: bool,
@@ -243,6 +249,7 @@ pub async fn pbs_namespace_delete(args: NamespaceDeleteArgs, ctx: &ToolCtx) -> R
         summary,
         steps,
         notes,
+        Some(&args.items),
     )
     .await
 }
@@ -446,6 +453,7 @@ mod tests {
             "s".into(),
             steps,
             vec![],
+            None,
         )
         .await
         .unwrap();
