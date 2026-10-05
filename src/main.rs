@@ -2,8 +2,8 @@
 //!
 //! Serves this plugin over the orca socket via the typed `Plugin` builder: the
 //! `pbs.` tool surface, the `service` backend and the `pbs-config` backup
-//! kind. The plugin is a `[[bin]]`,
-//! owns no runtime, and reaches orca only through the socket.
+//! kind. The plugin is a `[[bin]]`, owns no runtime, and reaches orca only
+//! through the socket.
 plugin_toolkit::instrument::bootstrap!();
 use pbs::PbsBackend;
 use plugin_toolkit::plugin::Plugin;
