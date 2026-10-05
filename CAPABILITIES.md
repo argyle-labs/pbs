@@ -8,7 +8,7 @@ generic `service.*` surface — no per-plugin tools. Runtimes: **docker,podman,l
 - [x] `workload_spec(runtime)` — docker/podman implemented (image, `<instance>-config`/`-lib`/`-logs` volumes, 16m `/run/proxmox-backup` tmpfs, published port); lxc/vm still unimplemented
 - [ ] `configure` — apply pbs config via its upstream API
 - [ ] `status` — health + rich diagnostics returned in the typed `ServiceStatus.info`
-- [x] `pbs-config` backup kind ([`config_backup`](src/config_backup.rs)) — `/etc/proxmox-backup` for `backup.run` / `backup.restore`, plus `pbs.config_backup.detail` and the `pbs.config_restore` scratch restore
+- [x] `pbs-config` backup kind ([`config_backup`](src/config_backup.rs)) — `/etc/proxmox-backup` for `backup.run` / `backup.restore`, plus `pbs.config_backup.detail`, the `pbs.config_restore` scratch restore and `pbs.config_recover`
 
 > Declarative descriptor is implemented and the plugin **registers + loads live**
 > in orca today (`service.list` shows it). `workload_spec`/`configure`/`status`
