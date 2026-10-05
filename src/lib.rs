@@ -8,6 +8,7 @@
 
 pub mod api;
 pub mod client;
+pub mod config_backup;
 pub mod endpoint;
 pub mod enroll;
 pub mod groups;
@@ -310,12 +311,6 @@ mod tests {
         assert!(spec.mounts.iter().all(|m| m.validation_error().is_none()));
     }
 
-    /// Lock files, rotated backups and the `.lock` siblings PBS creates next
-    /// to a config file hold no state of their own.
-    fn transient(name: &str) -> bool {
-        name.starts_with('.') || name.ends_with(".lock") || name.contains(".bak-")
-    }
-
     #[test]
     fn every_live_config_file_is_known_and_backed_up() {
         let live: Vec<&str> = include_str!("../tests/fixtures/etc_proxmox_backup.ls")
@@ -325,7 +320,7 @@ mod tests {
         assert!(live.contains(&"user.cfg") && live.contains(&"token.shadow"));
         let unknown: Vec<&&str> = live
             .iter()
-            .filter(|n| !transient(n) && !RESTORE_CRITICAL.contains(n))
+            .filter(|n| !config_backup::transient(n) && !RESTORE_CRITICAL.contains(n))
             .collect();
         assert!(
             unknown.is_empty(),

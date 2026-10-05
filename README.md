@@ -89,6 +89,14 @@ Every verb that changes PBS is a dry run unless called with `execute: true`, and
 
 **Known gap ([orca#763](https://gitea.scottkey.me/argyle-labs/orca/issues/763)):** orca does not yet pass the caller identity to plugins, so `execute` currently always fails with "no caller identity". The check fails closed on purpose; dry runs work.
 
+### Backing up the server's own config
+
+The plugin registers a `pbs-config` backup kind with orca's backup domain. `backup.run --kind pbs-config` copies `/etc/proxmox-backup` of every PBS container on the host, read from its config volume (`<volume root>/<instance>-config/_data`; the volume root defaults to `/var/lib/docker/volumes`, override with `ORCA_PBS_VOLUME_ROOT`). That covers `datastore.cfg`, `user.cfg`, `acl.cfg`, `token.shadow`, the sync, verify and prune job configs, `remote.cfg` and the server identity. Lock files and `.bak-*` rotations are skipped, and datastore contents are never included. Each backup is a file tree plus a manifest recording every file's size, SHA-256, mode and owner. A backup is refused if `user.cfg`, `acl.cfg`, `authkey.*` or `proxy.*` is missing. It holds the same secrets as the workload backup above, so store it only where you would trust the server itself.
+
+- `pbs.config_backup.detail` lists the file set per instance and gives the `schedule` row that runs the backup nightly at 02:40, plus the command that writes it (`orca config upsert schedule pbs-config-backup '…'`). Retention is keep-last 10. orca prunes by the retention of the target that receives the backup, so set `keep_last: 10` on that target.
+- `pbs.config_restore` restores a backup (its `path` from `backup.list`) into an absent or empty scratch directory and verifies the copy: every checksum, the datastores in `datastore.cfg`, and that every API token in `user.cfg` still has its secret in `token.shadow`. The dry run verifies the backup in place and lists the files it would write.
+- `backup.restore --kind pbs-config` restores onto the live config volume. It verifies the backup first and writes nothing if verification fails, restores owners and modes, then verifies the volume. Files the backup does not hold are left in place. Restart the container afterwards so PBS loads the restored keys.
+
 ## Layout
 
 - `src/` — the plugin (pure Rust): the `ServiceBackend` descriptor and the `pbs.*` API verbs.
