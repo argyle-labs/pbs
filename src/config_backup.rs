@@ -22,7 +22,7 @@ use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -51,6 +51,12 @@ const PERMISSION_BITS: u32 = 0o777;
 const TEMP_MARK: &str = ".orca-restore-";
 const PREV_MARK: &str = ".orca-prev-";
 const SWAP_MARK: &str = ".orca-swap-";
+/// A marker update in flight, renamed over the marker once fsynced.
+const NEXT_SUFFIX: &str = ".next";
+
+/// Per-file and whole-config read limits; PBS configs are a few KiB.
+const FILE_CAP: u64 = 16 << 20;
+const TOTAL_CAP: u64 = 256 << 20;
 
 const LOCK_ATTEMPTS: u32 = 100;
 const LOCK_RETRY: Duration = Duration::from_millis(100);
@@ -116,6 +122,14 @@ pub fn apply_schedule(instance: &str) -> String {
 /// redirecting it. Portable across Linux and macOS, unlike `openat2`.
 struct Dir(File);
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Kind {
+    Symlink,
+    Dir,
+    File,
+    Other,
+}
+
 enum Entry {
     Missing,
     Symlink,
@@ -134,6 +148,13 @@ fn cvt(ret: libc::c_int) -> io::Result<libc::c_int> {
     } else {
         Ok(ret)
     }
+}
+
+fn not_regular(name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{name} is not a regular file"),
+    )
 }
 
 impl Dir {
@@ -156,11 +177,43 @@ impl Dir {
 
     fn openat(&self, name: &str, flags: libc::c_int) -> io::Result<File> {
         let c = c_name(name)?;
-        let flags = flags | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let flags = flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY;
         // SAFETY: `c` is a valid C string and `self` owns an open fd.
         let fd = cvt(unsafe { libc::openat(self.fd(), c.as_ptr(), flags, 0o600 as libc::c_uint) })?;
         // SAFETY: `fd` was just returned by openat and nothing else owns it.
         Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// Type and inode of `name` without following or opening it, so a device
+    /// node or FIFO is classified and never opened.
+    fn stat(&self, name: &str) -> io::Result<Option<(Kind, u64)>> {
+        let c = c_name(name)?;
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: valid C string, open fd; `st` is written on success.
+        let r = unsafe {
+            libc::fstatat(
+                self.fd(),
+                c.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if let Err(e) = cvt(r) {
+            return if e.kind() == io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(e)
+            };
+        }
+        // SAFETY: fstatat succeeded and filled `st`.
+        let st = unsafe { st.assume_init() };
+        let kind = match st.st_mode & libc::S_IFMT {
+            libc::S_IFLNK => Kind::Symlink,
+            libc::S_IFDIR => Kind::Dir,
+            libc::S_IFREG => Kind::File,
+            _ => Kind::Other,
+        };
+        Ok(Some((kind, st.st_ino)))
     }
 
     fn sub(&self, name: &str) -> io::Result<Dir> {
@@ -168,9 +221,20 @@ impl Dir {
             .map(Dir)
     }
 
-    /// `O_NONBLOCK` so a FIFO planted here cannot hang the open.
+    /// A regular file only: checked before the open and again on the fd, so
+    /// something swapped in between is refused. `O_NONBLOCK` keeps a FIFO
+    /// that slips through from hanging the open.
     fn file(&self, name: &str) -> io::Result<File> {
-        self.openat(name, libc::O_RDONLY | libc::O_NONBLOCK)
+        match self.stat(name)? {
+            Some((Kind::File, _)) => {}
+            None => return Err(io::Error::from(io::ErrorKind::NotFound)),
+            Some(_) => return Err(not_regular(name)),
+        }
+        let f = self.openat(name, libc::O_RDONLY | libc::O_NONBLOCK)?;
+        if !f.metadata()?.is_file() {
+            return Err(not_regular(name));
+        }
+        Ok(f)
     }
 
     /// Created exclusively and `0600` until the caller sets its final mode.
@@ -179,21 +243,13 @@ impl Dir {
     }
 
     fn entry(&self, name: &str) -> io::Result<Entry> {
-        match self.file(name) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Entry::Missing),
-            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Ok(Entry::Symlink),
-            Err(e) => Err(e),
-            Ok(f) => {
-                let m = f.metadata()?;
-                Ok(if m.is_dir() {
-                    Entry::Dir(Dir(f))
-                } else if m.is_file() {
-                    Entry::File(f)
-                } else {
-                    Entry::Other
-                })
-            }
-        }
+        Ok(match self.stat(name)? {
+            None => Entry::Missing,
+            Some((Kind::Symlink, _)) => Entry::Symlink,
+            Some((Kind::Dir, _)) => Entry::Dir(self.sub(name)?),
+            Some((Kind::File, _)) => Entry::File(self.file(name)?),
+            Some((Kind::Other, _)) => Entry::Other,
+        })
     }
 
     fn mkdir(&self, name: &str) -> io::Result<()> {
@@ -283,6 +339,14 @@ fn split_rel(rel: &str) -> (&str, &str) {
     rel.rsplit_once('/').unwrap_or(("", rel))
 }
 
+fn join_rel(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
 /// The directory holding `rel`, and `rel`'s last component.
 fn parent_of<'a>(root: &Dir, rel: &'a str) -> Result<(Dir, &'a str)> {
     check_rel(rel)?;
@@ -295,10 +359,38 @@ fn open_rel(root: &Dir, rel: &str) -> Result<File> {
     dir.file(name).with_context(|| format!("open {rel}"))
 }
 
-fn read_rel(root: &Dir, rel: &str) -> Result<Vec<u8>> {
+/// Read a whole file, refusing anything over [`FILE_CAP`].
+fn read_capped(mut f: File, what: &str) -> Result<Vec<u8>> {
+    let len = f.metadata()?.len();
+    if len > FILE_CAP {
+        bail!("{what} is {len} bytes, over the {FILE_CAP}-byte limit");
+    }
     let mut buf = Vec::new();
-    open_rel(root, rel)?.read_to_end(&mut buf)?;
+    Read::by_ref(&mut f)
+        .take(FILE_CAP + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > FILE_CAP {
+        bail!("{what} grew past the {FILE_CAP}-byte limit while it was read");
+    }
     Ok(buf)
+}
+
+fn read_rel(root: &Dir, rel: &str) -> Result<Vec<u8>> {
+    read_capped(open_rel(root, rel)?, rel)
+}
+
+/// A file outside any container-writable tree (the store's slot record,
+/// docker's state), still opened without following a final symlink.
+fn read_path(path: &Path) -> Result<Vec<u8>> {
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    if !f.metadata()?.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    read_capped(f, &path.display().to_string())
 }
 
 fn apply_meta(f: &File, mode: u32, owner: Option<(u32, u32)>) -> Result<()> {
@@ -360,17 +452,24 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// Read and validate: a manifest names the paths a restore writes as
-    /// root, so every path must be a plain relative path, listed once, under
-    /// a listed directory, and no mode may carry setuid, setgid or sticky bits.
+    /// Read and validate a payload's manifest without checking it against
+    /// the backup record; restores use [`verified_manifest`].
     pub fn read(payload: &Path) -> Result<Self> {
         let raw = read_rel(&Dir::open(payload)?, MANIFEST)?;
-        let m: Manifest = serde_json::from_slice(&raw)
-            .with_context(|| format!("parse {}", payload.join(MANIFEST).display()))?;
+        Self::parse(&raw, payload)
+    }
+
+    /// A manifest names the paths a restore writes as root, so every path
+    /// must be a plain relative path, listed once, under a listed directory;
+    /// no mode may carry setuid, setgid or sticky bits; and no file may
+    /// exceed the read caps.
+    fn parse(raw: &[u8], payload: &Path) -> Result<Self> {
+        let at = || payload.join(MANIFEST).display().to_string();
+        let m: Manifest = serde_json::from_slice(raw).with_context(|| format!("parse {}", at()))?;
         if m.version != MANIFEST_VERSION {
             bail!(
                 "{}: manifest version {} is not {MANIFEST_VERSION}",
-                payload.join(MANIFEST).display(),
+                at(),
                 m.version
             );
         }
@@ -397,8 +496,49 @@ impl Manifest {
                 bail!("manifest lists {path:?} but not its directory {parent:?}");
             }
         }
+        let mut total = 0u64;
+        for f in &m.files {
+            if f.size > FILE_CAP {
+                bail!(
+                    "manifest gives {:?} {} bytes, over the limit",
+                    f.path,
+                    f.size
+                );
+            }
+            total += f.size;
+        }
+        if total > TOTAL_CAP {
+            bail!("manifest totals {total} bytes, over the {TOTAL_CAP}-byte limit");
+        }
         Ok(m)
     }
+}
+
+/// The payload's manifest, accepted only if it hashes to the checksum the
+/// backup record holds for it. The record is `manifest.json` in the slot
+/// beside `payload/`; a missing checksum is refused like a wrong one.
+/// orca verifying slot checksums itself is orca#478.
+pub fn verified_manifest(payload: &Path) -> Result<Manifest> {
+    let slot = payload
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no backup slot", payload.display()))?;
+    let record: Value = serde_json::from_slice(&read_path(&slot.join(SLOT_MANIFEST))?)
+        .with_context(|| format!("parse the backup record in {}", slot.display()))?;
+    let Some(want) = record["checksum"].as_str() else {
+        bail!(
+            "the backup record in {} has no checksum; refusing to restore a backup that cannot be verified",
+            slot.display()
+        );
+    };
+    let raw = read_rel(&Dir::open(payload)?, MANIFEST)?;
+    let got = format!("sha256:{}", sha256_hex(&raw));
+    if want != got {
+        bail!(
+            "backup checksum mismatch in {}: the record has {want}, the payload manifest hashes to {got}",
+            slot.display()
+        );
+    }
+    Manifest::parse(&raw, payload)
 }
 
 /// A relative, `/`-separated path with no empty, `.` or `..` segment.
@@ -506,50 +646,71 @@ fn stamps(src: &Dir) -> Result<BTreeMap<String, Stamp>> {
     Ok(out)
 }
 
+/// The source as read: directory entries, and each file with its bytes.
+struct Snapshot {
+    dirs: Vec<DirEntry>,
+    files: Vec<(FileEntry, Vec<u8>)>,
+}
+
 /// Copy `source` into `payload/files` and write the manifest.
 pub fn capture(source: &Path, payload: &Path, instance: &str) -> Result<Manifest> {
     capture_with(source, payload, instance, &|| {})
 }
 
-/// Each file is hashed from the bytes read off the source, and every
-/// source file is re-stamped after the whole copy: a capture that raced a
-/// change is retried once, then refused.
+/// The whole source is read into memory under PBS's config locks, re-stamped
+/// and the locks released before anything is written, so PBS is held up only
+/// for the reads. A read that raced a change is retried once, then refused.
 fn capture_with(
     source: &Path,
     payload: &Path,
     instance: &str,
-    after_copy: &dyn Fn(),
+    after_read: &dyn Fn(),
 ) -> Result<Manifest> {
     let src = Dir::open(source)?;
+    let snapshot = {
+        let _locks = hold_locks(&src)?;
+        read_snapshot(&src, after_read).with_context(|| format!("read {}", source.display()))?
+    };
+    let manifest = Manifest {
+        version: MANIFEST_VERSION,
+        instance: instance.to_string(),
+        source: source.display().to_string(),
+        dirs: snapshot.dirs,
+        files: snapshot.files.iter().map(|(f, _)| f.clone()).collect(),
+    };
     let out = Dir::open(payload)?;
-    let _locks = hold_locks(&src)?;
-    for _ in 0..2 {
-        let (dirs, files, before) = capture_once(&src, &out)?;
-        after_copy();
-        if stamps(&src)? == before {
-            let manifest = Manifest {
-                version: MANIFEST_VERSION,
-                instance: instance.to_string(),
-                source: source.display().to_string(),
-                dirs,
-                files,
-            };
-            let mut f = out.create(MANIFEST)?;
-            f.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
-            f.sync_all()?;
-            return Ok(manifest);
-        }
-        fs::remove_dir_all(payload.join(FILES_DIR))?;
+    out.mkdir(FILES_DIR)?;
+    let root = out.sub(FILES_DIR)?;
+    for d in &manifest.dirs {
+        let (parent, name) = parent_of(&root, &d.path)?;
+        parent.mkdir(name)?;
     }
-    bail!(
-        "{} kept changing while it was copied; try again",
-        source.display()
-    )
+    for (f, bytes) in &snapshot.files {
+        let (parent, name) = parent_of(&root, &f.path)?;
+        let mut to = parent.create(name)?;
+        to.write_all(bytes)
+            .and_then(|()| to.sync_all())
+            .with_context(|| format!("write {}", f.path))?;
+    }
+    let mut f = out.create(MANIFEST)?;
+    f.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
+    f.sync_all()?;
+    out.0.sync_all()?;
+    Ok(manifest)
 }
 
-type Captured = (Vec<DirEntry>, Vec<FileEntry>, BTreeMap<String, Stamp>);
+fn read_snapshot(src: &Dir, after_read: &dyn Fn()) -> Result<Snapshot> {
+    for _ in 0..2 {
+        let (snapshot, before) = read_once(src)?;
+        after_read();
+        if stamps(src)? == before {
+            return Ok(snapshot);
+        }
+    }
+    bail!("it kept changing while it was read; try again")
+}
 
-fn capture_once(src: &Dir, out: &Dir) -> Result<Captured> {
+fn read_once(src: &Dir) -> Result<(Snapshot, BTreeMap<String, Stamp>)> {
     let (dir_names, file_names) = scan(src)?;
     let missing = missing_required(&file_names);
     if !missing.is_empty() {
@@ -558,13 +719,9 @@ fn capture_once(src: &Dir, out: &Dir) -> Result<Captured> {
             missing.join(", ")
         );
     }
-    out.mkdir(FILES_DIR)?;
-    let root = out.sub(FILES_DIR)?;
     let mut dirs = Vec::with_capacity(dir_names.len());
     for rel in dir_names {
         let meta = open_dir(src, &rel)?.0.metadata()?;
-        let (parent, name) = parent_of(&root, &rel)?;
-        parent.mkdir(name)?;
         dirs.push(DirEntry {
             mode: meta.mode() & PERMISSION_BITS,
             uid: meta.uid(),
@@ -574,39 +731,41 @@ fn capture_once(src: &Dir, out: &Dir) -> Result<Captured> {
     }
     let mut files = Vec::with_capacity(file_names.len());
     let mut before = BTreeMap::new();
+    let mut total = 0u64;
     for rel in file_names {
-        let mut from = open_rel(src, &rel)?;
+        let from = open_rel(src, &rel)?;
         let meta = from.metadata()?;
-        if !meta.is_file() {
-            bail!("{rel} is no longer a regular file");
+        let buf = read_capped(from, &rel)?;
+        total += buf.len() as u64;
+        if total > TOTAL_CAP {
+            bail!("the config is over the {TOTAL_CAP}-byte limit");
         }
-        let mut buf = Vec::new();
-        from.read_to_end(&mut buf)?;
-        let (parent, name) = parent_of(&root, &rel)?;
-        let mut to = parent.create(name)?;
-        to.write_all(&buf)
-            .and_then(|()| to.sync_all())
-            .with_context(|| format!("copy {rel}"))?;
         before.insert(rel.clone(), stamp(&meta));
-        files.push(FileEntry {
-            sha256: sha256_hex(&buf),
-            size: buf.len() as u64,
-            mode: meta.mode() & PERMISSION_BITS,
-            uid: meta.uid(),
-            gid: meta.gid(),
-            path: rel,
-        });
+        files.push((
+            FileEntry {
+                sha256: sha256_hex(&buf),
+                size: buf.len() as u64,
+                mode: meta.mode() & PERMISSION_BITS,
+                uid: meta.uid(),
+                gid: meta.gid(),
+                path: rel,
+            },
+            buf,
+        ));
     }
-    Ok((dirs, files, before))
+    Ok((Snapshot { dirs, files }, before))
 }
 
 /// PBS rewrites each config file by atomic rename while holding an exclusive
-/// flock on its `.lck`/`.lock` sibling. Holding all of them shared gives a
-/// view consistent across files (`user.cfg` with `token.shadow`). They are
-/// taken non-blocking and all-or-nothing, so this never waits while holding
-/// one and cannot deadlock with PBS, whose writers wait out the few
-/// milliseconds of the copy inside their own lock timeout. Missing lock
-/// files are not created: a root-owned one would lock PBS out.
+/// `flock(2)` on its `.lck`/`.lock` sibling: `pbs_config::open_backup_lockfile`
+/// calls `proxmox_sys::fs::open_file_locked`, whose `lock_file` uses
+/// `nix::fcntl::flock`, with a 10 s default timeout. `File::try_lock_shared`
+/// is the same `flock`. Holding all of them shared gives a view consistent
+/// across files (`user.cfg` with `token.shadow`). They are taken
+/// non-blocking and all-or-nothing, so this never waits while holding one
+/// and cannot deadlock with PBS, whose writers wait out the reads inside
+/// that timeout. Missing lock files are not created: a root-owned one would
+/// lock PBS out.
 fn hold_locks(src: &Dir) -> Result<Vec<File>> {
     let names: Vec<String> = src
         .names()?
@@ -719,28 +878,32 @@ pub fn verify(dir: &Path, manifest: &Manifest) -> Verification {
     v
 }
 
-/// Owner and mode of every restored directory and file against the manifest.
-pub fn verify_meta(dir: &Path, manifest: &Manifest) -> Vec<String> {
+/// Owner and mode of every restored file and directory against the
+/// manifest. A restore never changes the owner of a directory that already
+/// existed, so a directory's owner is checked only if it is in `created`.
+pub fn verify_meta(dir: &Path, manifest: &Manifest, created: &[String]) -> Vec<String> {
     let root = match Dir::open(dir) {
         Ok(r) => r,
         Err(e) => return vec![format!("{e:#}")],
     };
     let dirs = manifest.dirs.iter().map(|d| {
         let meta = open_dir(&root, &d.path).and_then(|x| Ok(x.0.metadata()?));
-        (&d.path, (d.mode, d.uid, d.gid), meta)
+        let owned = created.contains(&d.path);
+        (&d.path, (d.mode, d.uid, d.gid), owned, meta)
     });
     let files = manifest.files.iter().map(|f| {
         let meta = open_rel(&root, &f.path).and_then(|x| Ok(x.metadata()?));
-        (&f.path, (f.mode, f.uid, f.gid), meta)
+        (&f.path, (f.mode, f.uid, f.gid), true, meta)
     });
     let mut problems = Vec::new();
-    for (path, want, meta) in dirs.chain(files) {
+    for (path, want, owned, meta) in dirs.chain(files) {
         let Ok(meta) = meta else {
             problems.push(format!("{path}: missing"));
             continue;
         };
         let got = (meta.mode() & PERMISSION_BITS, meta.uid(), meta.gid());
-        if got != want {
+        let differs = if owned { got != want } else { got.0 != want.0 };
+        if differs {
             problems.push(format!(
                 "{path}: {}:{} {:o}, backup has {}:{} {:o}",
                 got.1, got.2, got.0, want.1, want.2, want.0
@@ -763,14 +926,28 @@ fn section_ids(text: &str, kind: &str) -> Vec<String> {
 // Restore
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Written once every file is staged and every original set aside, removed
-/// before the set-aside originals are. While it exists the directory may be
-/// half swapped and only [`recover`] can settle it; without it the live
-/// files are consistent and any leftovers are disposable.
+/// How far a restore got, recorded in its marker before each step it
+/// cannot take back unannounced.
+#[orca_struct]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum Phase {
+    /// Originals untouched; temp files and created directories may exist.
+    Staging,
+    /// Originals set aside; some files may already be replaced.
+    Swapping,
+    /// A swap failed and the originals were being put back.
+    RollingBack,
+}
+
+/// `.orca-swap-<tag>` at the config root, written before anything else and
+/// removed last. Updated by writing `<marker>.next` and renaming it over the
+/// marker, so a crash leaves the old or the new state, never a torn one.
 #[orca_struct]
 #[derive(Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SwapMarker {
+    phase: Phase,
     files: Vec<MarkedFile>,
     created_dirs: Vec<String>,
 }
@@ -798,11 +975,19 @@ type Rename<'a> = &'a dyn Fn(&Dir, &str, &str) -> io::Result<()>;
 /// Write the captured directories and files into `dest`, which must already
 /// exist, with their recorded modes and, with `owners`, their uid/gid (the
 /// proxy runs as `backup` and cannot read a root-owned `authkey.pub`).
+/// Ownership is applied to files and to directories this creates; an
+/// existing directory keeps its owner. Returns the directories created.
 ///
-/// Every file is staged and fsynced before any is replaced and the replaced
-/// files are hard-linked aside; on any reported error the swap is rolled
-/// back. A crash mid-swap leaves a marker that [`recover`] settles.
-pub fn materialize(payload: &Path, dest: &Path, manifest: &Manifest, owners: bool) -> Result<()> {
+/// Every file is checked against the manifest as it is staged, all are
+/// fsynced before any is replaced, and the replaced files are hard-linked
+/// aside; on any reported error the swap is rolled back. A crash leaves a
+/// marker that [`recover`] settles.
+pub fn materialize(
+    payload: &Path,
+    dest: &Path,
+    manifest: &Manifest,
+    owners: bool,
+) -> Result<Vec<String>> {
     let tag = plugin_toolkit::id::new();
     materialize_with(payload, dest, manifest, owners, &tag, &|d, a, b| {
         d.rename(a, b)
@@ -813,6 +998,7 @@ struct Work<'a> {
     root: Dir,
     tag: &'a str,
     owners: bool,
+    phase: Phase,
     created: Vec<String>,
     staged: Vec<Staged>,
     marker: Option<String>,
@@ -826,13 +1012,13 @@ fn materialize_with(
     owners: bool,
     tag: &str,
     rename: Rename,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let root = Dir::open(dest)?;
     let left = leftovers(&root)?;
     if !left.is_empty() {
         bail!(
             "an interrupted restore left {} in {}; settle it with pbs.config_recover (action rollback or finish) first",
-            left.join(", "),
+            left.iter().map(Left::rel).collect::<Vec<_>>().join(", "),
             dest.display()
         );
     }
@@ -841,19 +1027,27 @@ fn materialize_with(
         root,
         tag,
         owners,
+        phase: Phase::Staging,
         created: Vec::new(),
         staged: Vec::new(),
         marker: None,
         failures: Vec::new(),
     };
     let result = w
-        .make_dirs(manifest)
+        .write_marker()
+        .and_then(|()| w.make_dirs(manifest))
         .and_then(|()| w.stage(&src, manifest))
         .and_then(|()| w.set_aside())
-        .and_then(|()| w.mark())
+        .and_then(|()| {
+            w.phase = Phase::Swapping;
+            w.write_marker()
+        })
         .and_then(|()| w.swap(rename));
     match result {
-        Ok(()) => w.finish(manifest),
+        Ok(()) => {
+            w.finish(manifest)?;
+            Ok(w.created)
+        }
         Err(e) => {
             let left = w.undo();
             if left.is_empty() {
@@ -870,19 +1064,46 @@ impl Work<'_> {
         self.owners.then_some((uid, gid))
     }
 
+    fn write_marker(&mut self) -> Result<()> {
+        let marker = SwapMarker {
+            phase: self.phase,
+            files: self
+                .staged
+                .iter()
+                .map(|s| MarkedFile {
+                    path: s.rel.clone(),
+                    had_prev: s.prev.is_some(),
+                })
+                .collect(),
+            created_dirs: self.created.clone(),
+        };
+        let name = format!("{SWAP_MARK}{}", self.tag);
+        let next = format!("{name}{NEXT_SUFFIX}");
+        let mut f = self.root.create(&next)?;
+        f.write_all(&serde_json::to_vec(&marker)?)?;
+        f.sync_all()?;
+        self.root.rename(&next, &name)?;
+        self.marker = Some(name);
+        self.root.0.sync_all()?;
+        Ok(())
+    }
+
+    /// Each directory is recorded in the marker before it is created, so a
+    /// crash never leaves one that recovery does not know to remove.
     fn make_dirs(&mut self, manifest: &Manifest) -> Result<()> {
         let mut dirs: Vec<&DirEntry> = manifest.dirs.iter().collect();
         dirs.sort_by_key(|d| d.path.matches('/').count());
         for d in dirs {
             let (parent, name) = parent_of(&self.root, &d.path)?;
-            match parent.entry(name)? {
-                Entry::Dir(_) => {}
-                Entry::Missing => {
-                    parent.mkdir(name)?;
+            match parent.stat(name)? {
+                Some((Kind::Dir, _)) => {}
+                None => {
                     self.created.push(d.path.clone());
+                    self.write_marker()?;
+                    parent.mkdir(name)?;
                     apply_meta(&parent.sub(name)?.0, d.mode, self.owner(d.uid, d.gid))?;
                 }
-                _ => bail!("{} is a symlink or not a directory", d.path),
+                Some(_) => bail!("{} is a symlink or not a directory", d.path),
             }
         }
         Ok(())
@@ -890,6 +1111,13 @@ impl Work<'_> {
 
     fn stage(&mut self, src: &Dir, manifest: &Manifest) -> Result<()> {
         for f in &manifest.files {
+            let bytes = read_rel(src, &f.path)?;
+            if bytes.len() as u64 != f.size || sha256_hex(&bytes) != f.sha256 {
+                bail!(
+                    "{} in the backup no longer matches its manifest; nothing replaced",
+                    f.path
+                );
+            }
             let (dir, name) = parent_of(&self.root, &f.path)?;
             let tmp = format!(".{name}{TEMP_MARK}{}", self.tag);
             let mut out = dir
@@ -903,7 +1131,7 @@ impl Work<'_> {
                 prev: None,
                 displaced: false,
             });
-            out.write_all(&read_rel(src, &f.path)?)
+            out.write_all(&bytes)
                 .with_context(|| format!("stage {}", f.path))?;
             apply_meta(&out, f.mode, self.owner(f.uid, f.gid))
                 .with_context(|| format!("stage {}", f.path))?;
@@ -914,50 +1142,36 @@ impl Work<'_> {
 
     fn set_aside(&mut self) -> Result<()> {
         for s in &mut self.staged {
-            match s.dir.entry(&s.name)? {
-                Entry::File(_) => {
+            match s.dir.stat(&s.name)? {
+                Some((Kind::File, _)) => {
                     let prev = format!(".{}{PREV_MARK}{}", s.name, self.tag);
                     s.dir
                         .link(&s.name, &prev)
                         .with_context(|| format!("set aside {}", s.rel))?;
                     s.prev = Some(prev);
                 }
-                Entry::Missing => {}
-                _ => bail!("{} is a symlink or not a regular file", s.rel),
+                None => {}
+                Some(_) => bail!("{} is a symlink or not a regular file", s.rel),
             }
         }
         self.sync_dirs()
     }
 
-    fn mark(&mut self) -> Result<()> {
-        let marker = SwapMarker {
-            files: self
-                .staged
-                .iter()
-                .map(|s| MarkedFile {
-                    path: s.rel.clone(),
-                    had_prev: s.prev.is_some(),
-                })
-                .collect(),
-            created_dirs: self.created.clone(),
-        };
-        let name = format!("{SWAP_MARK}{}", self.tag);
-        let mut f = self.root.create(&name)?;
-        self.marker = Some(name);
-        f.write_all(&serde_json::to_vec(&marker)?)?;
-        f.sync_all()?;
-        self.root.0.sync_all()?;
-        Ok(())
-    }
-
+    /// The marker turns to [`Phase::RollingBack`] before the first file is
+    /// put back, so recovery after a crash here can only roll back.
     fn swap(&mut self, rename: Rename) -> Result<()> {
         for i in 0..self.staged.len() {
             let s = &self.staged[i];
             if let Err(e) = rename(&s.dir, &s.tmp, &s.name) {
                 let failed = s.rel.clone();
+                self.phase = Phase::RollingBack;
+                if let Err(m) = self.write_marker() {
+                    self.failures
+                        .push(format!("could not mark the rollback: {m:#}"));
+                }
                 for s in self.staged[..i].iter_mut().rev() {
                     let back = match &s.prev {
-                        Some(prev) => s.dir.rename(prev, &s.name),
+                        Some(prev) => rename(&s.dir, prev, &s.name),
                         None => s.dir.unlink(&s.name),
                     };
                     if let Err(e) = back {
@@ -992,12 +1206,13 @@ impl Work<'_> {
             }
         }
         for d in &manifest.dirs {
-            apply_meta(
-                &open_dir(&self.root, &d.path)?.0,
-                d.mode,
-                self.owner(d.uid, d.gid),
-            )
-            .with_context(|| format!("files restored, but setting {} failed", d.path))?;
+            let owner = if self.created.contains(&d.path) {
+                self.owner(d.uid, d.gid)
+            } else {
+                None
+            };
+            apply_meta(&open_dir(&self.root, &d.path)?.0, d.mode, owner)
+                .with_context(|| format!("files restored, but setting {} failed", d.path))?;
         }
         self.sync_dirs()
     }
@@ -1049,26 +1264,69 @@ impl Work<'_> {
     }
 }
 
-/// Paths of temp files, set-aside originals and swap markers under `root`.
-fn leftovers(root: &Dir) -> Result<Vec<String>> {
+/// A file a restore leaves behind while it runs.
+#[derive(Debug, Clone)]
+struct Left {
+    dir: String,
+    name: String,
+    kind: Kind,
+}
+
+impl Left {
+    fn rel(&self) -> String {
+        join_rel(&self.dir, &self.name)
+    }
+
+    /// The tag of a temp file or set-aside original, and the file it shadows.
+    fn shadowing(&self) -> Option<(&str, &str)> {
+        let (base, tag) = self
+            .name
+            .split_once(TEMP_MARK)
+            .or_else(|| self.name.split_once(PREV_MARK))?;
+        Some((base.strip_prefix('.').unwrap_or(base), tag))
+    }
+
+    /// A swap marker's tag; markers count only at the config root.
+    fn marker_tag(&self) -> Option<&str> {
+        if !self.dir.is_empty() || self.name.ends_with(NEXT_SUFFIX) {
+            return None;
+        }
+        self.name.strip_prefix(SWAP_MARK)
+    }
+}
+
+fn is_leftover(name: &str) -> bool {
+    name.contains(TEMP_MARK) || name.contains(PREV_MARK) || name.starts_with(SWAP_MARK)
+}
+
+/// Temp files, set-aside originals and swap markers under `root`, found by
+/// name and classified without being opened.
+fn leftovers(root: &Dir) -> Result<Vec<Left>> {
     let mut out = Vec::new();
     leftovers_at(root, "", &mut out)?;
     Ok(out)
 }
 
-fn leftovers_at(dir: &Dir, prefix: &str, out: &mut Vec<String>) -> Result<()> {
+fn leftovers_at(dir: &Dir, rel_dir: &str, out: &mut Vec<Left>) -> Result<()> {
     for name in dir.names()? {
-        let rel = format!("{prefix}{name}");
-        if name.contains(TEMP_MARK) || name.contains(PREV_MARK) || name.starts_with(SWAP_MARK) {
-            out.push(rel);
-        } else if let Entry::Dir(sub) = dir.entry(&name)? {
-            leftovers_at(&sub, &format!("{rel}/"), out)?;
+        let Some((kind, _)) = dir.stat(&name)? else {
+            continue;
+        };
+        if is_leftover(&name) {
+            out.push(Left {
+                dir: rel_dir.to_string(),
+                name,
+                kind,
+            });
+        } else if kind == Kind::Dir {
+            leftovers_at(&dir.sub(&name)?, &join_rel(rel_dir, &name), out)?;
         }
     }
     Ok(())
 }
 
-/// One step of settling an interrupted restore, relative to the config dir.
+/// One step of settling an interrupted restore. `dir` is relative to the
+/// config dir and `name` a single component, so no step acts through a path.
 #[derive(Debug, Clone, PartialEq)]
 enum Op {
     Rename {
@@ -1086,14 +1344,6 @@ enum Op {
     },
 }
 
-fn join_rel(dir: &str, name: &str) -> String {
-    if dir.is_empty() {
-        name.to_string()
-    } else {
-        format!("{dir}/{name}")
-    }
-}
-
 impl Op {
     fn describe(&self) -> String {
         match self {
@@ -1105,77 +1355,127 @@ impl Op {
         }
     }
 
-    fn apply(&self, root: &Dir) -> Result<()> {
+    fn dir(&self) -> &str {
         match self {
-            Op::Rename { dir, from, to } => open_dir(root, dir)?.rename(from, to)?,
-            Op::Unlink { dir, name } => discard(&open_dir(root, dir)?, name)?,
-            Op::Rmdir { dir, name } => open_dir(root, dir)?.rmdir(name)?,
+            Op::Rename { dir, .. } | Op::Unlink { dir, .. } | Op::Rmdir { dir, .. } => dir,
+        }
+    }
+
+    fn apply(&self, root: &Dir) -> Result<()> {
+        let d = open_dir(root, self.dir())?;
+        match self {
+            Op::Rename { from, to, .. } => d.rename(from, to)?,
+            Op::Unlink { name, .. } => discard(&d, name)?,
+            Op::Rmdir { name, .. } => match d.rmdir(name) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                r => r?,
+            },
         }
         Ok(())
     }
 }
 
-/// The steps that settle every interrupted restore in `dest`. With a swap
-/// marker, `finish` moves the remaining staged files into place and
-/// rollback puts the originals back; without one the live files are already
-/// consistent and both just remove the leftovers.
+fn unlink(dir: &str, name: impl Into<String>) -> Op {
+    Op::Unlink {
+        dir: dir.to_string(),
+        name: name.into(),
+    }
+}
+
+/// The steps that settle every interrupted restore in `dest`.
+///
+/// A marker in [`Phase::Swapping`] can be finished (staged files moved into
+/// place) or rolled back (originals put back). [`Phase::Staging`] and
+/// [`Phase::RollingBack`] can only be rolled back. Leftovers whose tag has no
+/// marker belong to no live operation and are removed either way. Created
+/// directories are removed on rollback once empty.
 fn recovery(dest: &Path, finish: bool) -> Result<(Dir, Vec<Op>)> {
     let root = Dir::open(dest)?;
     let left = leftovers(&root)?;
-    let exists = |rel: &str| left.iter().any(|l| l == rel);
-    let mut ops = Vec::new();
-    let mut markers = Vec::new();
-    for rel in &left {
-        let (_, name) = split_rel(rel);
-        if let Some(tag) = name.strip_prefix(SWAP_MARK) {
-            markers.push((rel.clone(), tag.to_string()));
-        }
+    let stuck: Vec<String> = left
+        .iter()
+        .filter(|l| !matches!(l.kind, Kind::File | Kind::Symlink))
+        .map(Left::rel)
+        .collect();
+    if !stuck.is_empty() {
+        bail!(
+            "{} in {} named like restore leftovers but not files; a restore never creates these, so inspect and remove them by hand, then run recovery again",
+            stuck.join(", "),
+            dest.display()
+        );
     }
-    let marked = |name: &str| markers.iter().any(|(_, t)| name.ends_with(t.as_str()));
-    for (marker_rel, tag) in &markers {
-        let m: SwapMarker = serde_json::from_slice(&read_rel(&root, marker_rel)?)
-            .with_context(|| format!("parse {marker_rel}"))?;
+    let has = |dir: &str, name: &str| left.iter().any(|l| l.dir == dir && l.name == name);
+    let mut ops = Vec::new();
+    let mut tags = Vec::new();
+    for l in &left {
+        let Some(tag) = l.marker_tag() else {
+            continue;
+        };
+        let m: SwapMarker = serde_json::from_slice(&read_rel(&root, &l.name)?)
+            .with_context(|| format!("parse {}", l.name))?;
+        if finish && m.phase != Phase::Swapping {
+            bail!(
+                "{} records a restore that was {}; only rollback applies",
+                l.name,
+                match m.phase {
+                    Phase::Staging => "still staging",
+                    _ => "already rolling back",
+                }
+            );
+        }
         for f in &m.files {
             check_rel(&f.path)?;
             let (dir, name) = split_rel(&f.path);
             let tmp = format!(".{name}{TEMP_MARK}{tag}");
             let prev = format!(".{name}{PREV_MARK}{tag}");
-            let tmp_left = exists(&join_rel(dir, &tmp));
-            let prev_left = exists(&join_rel(dir, &prev));
-            let dir = dir.to_string();
+            let (tmp_left, prev_left) = (has(dir, &tmp), has(dir, &prev));
             if finish {
                 if tmp_left {
                     ops.push(Op::Rename {
-                        dir: dir.clone(),
+                        dir: dir.to_string(),
                         from: tmp,
                         to: name.to_string(),
                     });
                 }
                 if prev_left {
-                    ops.push(Op::Unlink { dir, name: prev });
+                    ops.push(unlink(dir, prev));
                 }
             } else if tmp_left {
-                // Never swapped, so the original is still in place and
-                // `prev` is a second link to it: renaming one hard link onto
-                // another is a no-op, so drop both extras instead.
-                ops.push(Op::Unlink {
-                    dir: dir.clone(),
-                    name: tmp,
-                });
+                // Never swapped: the original is in place and `prev` is a
+                // second link to it.
+                ops.push(unlink(dir, tmp));
                 if prev_left {
-                    ops.push(Op::Unlink { dir, name: prev });
+                    ops.push(unlink(dir, prev));
                 }
             } else if prev_left {
-                ops.push(Op::Rename {
-                    dir,
-                    from: prev,
-                    to: name.to_string(),
-                });
+                // Renaming a link onto another link to the same inode does
+                // nothing, so an original already back is just unlinked.
+                let d = open_dir(&root, dir)?;
+                let same = match (d.stat(&prev)?, d.stat(name)?) {
+                    (Some((_, a)), Some((_, b))) => a == b,
+                    _ => false,
+                };
+                if same {
+                    ops.push(unlink(dir, prev));
+                } else {
+                    ops.push(Op::Rename {
+                        dir: dir.to_string(),
+                        from: prev,
+                        to: name.to_string(),
+                    });
+                }
             } else if !f.had_prev {
-                ops.push(Op::Unlink {
-                    dir,
-                    name: name.to_string(),
-                });
+                ops.push(unlink(dir, name));
+            }
+        }
+        // Leftovers of this tag the file list does not cover: temp files
+        // and links from a restore that was still staging.
+        for o in &left {
+            let listed = o.shadowing().is_some_and(|(base, t)| {
+                t == tag && m.files.iter().any(|f| f.path == join_rel(&o.dir, base))
+            });
+            if !listed && o.shadowing().is_some_and(|(_, t)| t == tag) {
+                ops.push(unlink(&o.dir, o.name.clone()));
             }
         }
         if !finish {
@@ -1188,18 +1488,14 @@ fn recovery(dest: &Path, finish: bool) -> Result<(Dir, Vec<Op>)> {
                 });
             }
         }
-        ops.push(Op::Unlink {
-            dir: String::new(),
-            name: marker_rel.clone(),
-        });
+        ops.push(unlink("", l.name.clone()));
+        tags.push(tag);
     }
-    for rel in &left {
-        let (dir, name) = split_rel(rel);
-        if !name.starts_with(SWAP_MARK) && !marked(name) {
-            ops.push(Op::Unlink {
-                dir: dir.to_string(),
-                name: name.to_string(),
-            });
+    for l in &left {
+        let owned =
+            l.marker_tag().is_some() || l.shadowing().is_some_and(|(_, t)| tags.contains(&t));
+        if !owned {
+            ops.push(unlink(&l.dir, l.name.clone()));
         }
     }
     Ok((root, ops))
@@ -1214,12 +1510,7 @@ fn recover(dest: &Path, finish: bool) -> Result<Vec<String>> {
             .with_context(|| format!("{}; already done: [{}]", op.describe(), done.join(", ")))?;
         done.push(op.describe());
     }
-    let mut dirs: Vec<&str> = ops
-        .iter()
-        .map(|op| match op {
-            Op::Rename { dir, .. } | Op::Unlink { dir, .. } | Op::Rmdir { dir, .. } => dir.as_str(),
-        })
-        .collect();
+    let mut dirs: Vec<&str> = ops.iter().map(Op::dir).collect();
     dirs.sort();
     dirs.dedup();
     for d in dirs {
@@ -1251,8 +1542,7 @@ fn volume_users(containers_dir: &Path, volume: &str, data_dir: &Path) -> Result<
             continue;
         }
         let id = entry.file_name().to_string_lossy().into_owned();
-        let state = fs::read(entry.path().join("config.v2.json"))
-            .map_err(plugin_toolkit::anyhow::Error::from)
+        let state = read_path(&entry.path().join("config.v2.json"))
             .and_then(|raw| Ok(serde_json::from_slice::<Value>(&raw)?));
         let c = match state {
             Ok(c) => c,
@@ -1396,7 +1686,7 @@ impl PbsConfigKind {
 
     fn restore_from(&self, payload_dir: &Path, instance: &str) -> Result<Verification> {
         self.ensure_stopped(instance)?;
-        let manifest = Manifest::read(payload_dir)?;
+        let manifest = verified_manifest(payload_dir)?;
         let captured = verify(&payload_dir.join(FILES_DIR), &manifest);
         if !captured.ok() {
             bail!(
@@ -1411,12 +1701,14 @@ impl PbsConfigKind {
                 live.display()
             );
         }
-        materialize(payload_dir, &live, &manifest, true)?;
+        let created = materialize(payload_dir, &live, &manifest, true)?;
         self.ensure_stopped(instance).context(
             "a container started during the restore; stop it and start it again so PBS loads only the restored config",
         )?;
         let mut restored = verify(&live, &manifest);
-        restored.problems.extend(verify_meta(&live, &manifest));
+        restored
+            .problems
+            .extend(verify_meta(&live, &manifest, &created));
         if !restored.ok() {
             bail!(
                 "restored config failed verification: {}",
@@ -1643,7 +1935,7 @@ fn config_restore(
     const TOOL: &str = "pbs.config_restore";
     let payload = store_payload(&args.payload)?;
     let dest = Path::new(&args.dest);
-    let manifest = Manifest::read(&payload)?;
+    let manifest = verified_manifest(&payload)?;
     let captured = verify(&payload.join(FILES_DIR), &manifest);
     let mut blockers = Vec::new();
     if fs::symlink_metadata(dest).is_ok() {
@@ -1681,8 +1973,10 @@ fn config_restore(
     if !blockers.is_empty() {
         bail!("{TOOL}: refusing: {}", blockers.join("; "));
     }
-    fs::create_dir(dest).with_context(|| format!("create {}", dest.display()))?;
-    fs::set_permissions(dest, fs::Permissions::from_mode(0o700))?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dest)
+        .with_context(|| format!("create {}", dest.display()))?;
     materialize(&payload, dest, &manifest, false)?;
     let restored = verify(dest, &manifest);
     if !restored.ok() {
@@ -1854,7 +2148,37 @@ mod tests {
     }
 
     fn all_leftovers(dir: &Path) -> Vec<String> {
-        leftovers(&Dir::open(dir).unwrap()).unwrap()
+        leftovers(&Dir::open(dir).unwrap())
+            .unwrap()
+            .iter()
+            .map(Left::rel)
+            .collect()
+    }
+
+    /// `<tmp>/slot/payload`, as the store lays a slot out.
+    fn slotted() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = tmp.path().join("slot/payload");
+        fs::create_dir_all(&payload).unwrap();
+        (tmp, payload)
+    }
+
+    /// Write the slot record the store commits, carrying `checksum`.
+    fn commit(payload: &Path, checksum: Option<&str>) {
+        let record = json!({"id": "20261004-031000", "checksum": checksum});
+        fs::write(
+            payload.parent().unwrap().join(SLOT_MANIFEST),
+            record.to_string(),
+        )
+        .unwrap();
+    }
+
+    /// A backup of `kind`'s `pbs` instance, committed with its checksum.
+    fn backed_up(kind: &PbsConfigKind) -> (tempfile::TempDir, PathBuf) {
+        let (tmp, payload) = slotted();
+        let out = kind.backup_into(&payload, "pbs").unwrap();
+        commit(&payload, out.checksum.as_deref());
+        (tmp, payload)
     }
 
     fn mode(p: &Path) -> u32 {
@@ -2173,16 +2497,18 @@ mod tests {
     fn kind_backs_up_and_restores_a_rebuilt_container_over_the_wire() {
         let (tmp, kind, live) = host("pbs");
         container(tmp.path(), "abc", pbs_state(false));
-        let payload = tempfile::tempdir().unwrap();
+        let (_slot, payload) = slotted();
         fs::set_permissions(live.join("proxy.key"), fs::Permissions::from_mode(0o640)).unwrap();
 
         assert_eq!(
             dispatch_kind_op(&kind, OP_INSTANCES, json!({})).unwrap(),
             json!(["pbs"])
         );
-        let args = json!({"payload_dir": payload.path(), "instance": "pbs"});
+        let args = json!({"payload_dir": payload, "instance": "pbs"});
         let outcome = dispatch_kind_op(&kind, OP_BACKUP, args.clone()).unwrap();
-        assert!(outcome["checksum"].as_str().unwrap().starts_with("sha256:"));
+        let checksum = outcome["checksum"].as_str().unwrap();
+        assert!(checksum.starts_with("sha256:"));
+        commit(&payload, Some(checksum));
 
         // A rebuilt container: fresh identity, no datastores, no tokens, no acme.
         fs::write(live.join("authkey.key"), "fresh\n").unwrap();
@@ -2192,12 +2518,12 @@ mod tests {
         fs::write(live.join("user.cfg"), "user: root@pam\n").unwrap();
         dispatch_kind_op(&kind, OP_RESTORE, args).unwrap();
 
-        let m = Manifest::read(payload.path()).unwrap();
+        let m = Manifest::read(&payload).unwrap();
         let v = verify(&live, &m);
         assert!(v.ok(), "{:?}", v.problems);
         assert_eq!(v.datastores, ["willow-primary", "offsite"]);
         assert_eq!(v.tokens, ["root@pam!orca"]);
-        assert!(verify_meta(&live, &m).is_empty());
+        assert!(verify_meta(&live, &m, &["acme".to_string()]).is_empty());
         assert_eq!(mode(&live.join("proxy.key")), 0o640);
         assert_eq!(mode(&live.join("acme")), 0o750);
         assert!(all_leftovers(&live).is_empty());
@@ -2210,7 +2536,7 @@ mod tests {
         kind.backup_into(payload.path(), "pbs").unwrap();
         fs::set_permissions(live.join("authkey.key"), fs::Permissions::from_mode(0o644)).unwrap();
         fs::set_permissions(live.join("acme"), fs::Permissions::from_mode(0o777)).unwrap();
-        let p = verify_meta(&live, &Manifest::read(payload.path()).unwrap()).join("\n");
+        let p = verify_meta(&live, &Manifest::read(payload.path()).unwrap(), &[]).join("\n");
         assert!(p.contains("authkey.key") && p.contains("644"), "{p}");
         assert!(p.contains("acme:") && p.contains("777"), "{p}");
     }
@@ -2272,16 +2598,10 @@ mod tests {
     #[test]
     fn kind_restore_refuses_a_corrupt_backup_and_leaves_live_alone() {
         let (_tmp, kind, live) = host("pbs");
-        let payload = tempfile::tempdir().unwrap();
-        kind.backup_into(payload.path(), "pbs").unwrap();
-        fs::set_permissions(
-            payload.path().join("files/user.cfg"),
-            fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
-        fs::write(payload.path().join("files/user.cfg"), "user: evil@pam\n").unwrap();
+        let (_slot, payload) = backed_up(&kind);
+        fs::write(payload.join("files/user.cfg"), "user: evil@pam\n").unwrap();
         fs::write(live.join("authkey.key"), "fresh\n").unwrap();
-        let err = kind.restore(payload.path(), "pbs").unwrap_err();
+        let err = kind.restore(&payload, "pbs").unwrap_err();
         assert!(err.contains("nothing restored"), "{err}");
         assert_eq!(
             fs::read_to_string(live.join("authkey.key")).unwrap(),
@@ -2395,6 +2715,7 @@ mod tests {
         }));
         assert!(r.is_err());
         assert!(all_leftovers(live).iter().any(|l| l.starts_with(SWAP_MARK)));
+        assert!(!all_leftovers(live).iter().any(|l| l.ends_with(NEXT_SUFFIX)));
     }
 
     #[test]
@@ -2462,6 +2783,163 @@ mod tests {
         assert!(all_leftovers(&live).is_empty());
     }
 
+    #[test]
+    fn a_crash_during_rollback_can_only_be_rolled_back() {
+        let (live, payload, m) = drifted();
+        let calls = std::cell::Cell::new(0);
+        let crashing = |d: &Dir, a: &str, b: &str| {
+            calls.set(calls.get() + 1);
+            match calls.get() {
+                3 => Err(io::Error::other("disk full")),
+                4 => panic!("simulated crash while putting originals back"),
+                _ => d.rename(a, b),
+            }
+        };
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            materialize_with(payload.path(), live.path(), &m, false, "T", &crashing)
+        }));
+        assert!(r.is_err());
+        let err = format!("{:#}", recover(live.path(), true).unwrap_err());
+        assert!(err.contains("only rollback"), "{err}");
+        recover(live.path(), false).unwrap();
+        assert_all(live.path(), &m, |_| "live\n".to_string());
+        assert!(all_leftovers(live.path()).is_empty());
+    }
+
+    #[test]
+    fn a_crash_while_staging_removes_the_directories_it_created() {
+        let (live, _payload, _m) = drifted();
+        let l = live.path();
+        fs::remove_dir_all(l.join("acme")).unwrap();
+        let marker = json!({"phase": "staging", "files": [], "createdDirs": ["acme"]});
+        fs::write(l.join(".orca-swap-S"), marker.to_string()).unwrap();
+        fs::create_dir(l.join("acme")).unwrap();
+        fs::write(l.join("acme/.accounts.orca-restore-S"), "partial").unwrap();
+        fs::write(l.join(".user.cfg.orca-restore-S"), "partial").unwrap();
+
+        let err = format!("{:#}", recover(l, true).unwrap_err());
+        assert!(err.contains("still staging"), "{err}");
+        recover(l, false).unwrap();
+        assert!(!l.join("acme").exists());
+        assert!(all_leftovers(l).is_empty());
+        assert_eq!(fs::read_to_string(l.join("user.cfg")).unwrap(), "live\n");
+    }
+
+    #[test]
+    fn rollback_unlinks_a_set_aside_link_to_the_same_inode() {
+        let (live, _payload, _m) = drifted();
+        let l = live.path();
+        let marker = json!({"phase": "swapping",
+            "files": [{"path": "user.cfg", "hadPrev": true}], "createdDirs": []});
+        fs::write(l.join(".orca-swap-I"), marker.to_string()).unwrap();
+        fs::hard_link(l.join("user.cfg"), l.join(".user.cfg.orca-prev-I")).unwrap();
+        let (_, ops) = recovery(l, false).unwrap();
+        assert!(
+            ops.contains(&unlink("", ".user.cfg.orca-prev-I")),
+            "{ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|o| matches!(o, Op::Rename { .. })),
+            "{ops:?}"
+        );
+        recover(l, false).unwrap();
+        assert_eq!(fs::read_to_string(l.join("user.cfg")).unwrap(), "live\n");
+        assert!(all_leftovers(l).is_empty());
+    }
+
+    #[test]
+    fn markers_count_only_at_the_config_root() {
+        let (live, _payload, _m) = drifted();
+        fs::write(live.path().join("acme/.orca-swap-X"), "not a marker").unwrap();
+        let (_, ops) = recovery(live.path(), true).unwrap();
+        assert_eq!(ops, [unlink("acme", ".orca-swap-X")]);
+        recover(live.path(), true).unwrap();
+        assert!(all_leftovers(live.path()).is_empty());
+    }
+
+    #[test]
+    fn a_planted_leftover_directory_is_refused_with_instructions() {
+        let (live, payload, m) = drifted();
+        fs::create_dir(live.path().join(".user.cfg.orca-prev-Z")).unwrap();
+        assert!(materialize(payload.path(), live.path(), &m, false).is_err());
+        let err = format!("{:#}", recover(live.path(), false).unwrap_err());
+        assert!(err.contains("remove them by hand"), "{err}");
+    }
+
+    #[test]
+    fn staging_refuses_payload_bytes_that_differ_from_the_manifest() {
+        let (live, payload, m) = drifted();
+        fs::write(payload.path().join("files/user.cfg"), "user: evil@pam\n").unwrap();
+        let err = format!(
+            "{:#}",
+            materialize(payload.path(), live.path(), &m, false).unwrap_err()
+        );
+        assert!(err.contains("no longer matches"), "{err}");
+        assert_all(live.path(), &m, |_| "live\n".to_string());
+        assert!(all_leftovers(live.path()).is_empty());
+    }
+
+    #[test]
+    fn restores_refuse_a_missing_or_wrong_record_checksum() {
+        let (_store, payload) = stored();
+        let scratch = tempfile::tempdir().unwrap();
+        let dest = scratch.path().join("drill");
+        commit(&payload, None);
+        let err = config_restore(&restore_args(&payload, &dest, false), None).unwrap_err();
+        assert!(format!("{err:#}").contains("no checksum"), "{err:#}");
+        commit(&payload, Some("sha256:00"));
+        let err = config_restore(&restore_args(&payload, &dest, false), None).unwrap_err();
+        assert!(format!("{err:#}").contains("checksum mismatch"), "{err:#}");
+
+        let (_tmp, kind, live) = host("pbs");
+        let (_slot, payload) = backed_up(&kind);
+        commit(&payload, Some("sha256:00"));
+        fs::write(live.join("authkey.key"), "fresh\n").unwrap();
+        let err = kind.restore(&payload, "pbs").unwrap_err();
+        assert!(err.contains("checksum mismatch"), "{err}");
+        assert_eq!(
+            fs::read_to_string(live.join("authkey.key")).unwrap(),
+            "fresh\n"
+        );
+    }
+
+    #[test]
+    fn reads_over_the_cap_are_refused() {
+        let src = tempfile::tempdir().unwrap();
+        seed(src.path());
+        File::create(src.path().join("remote.cfg"))
+            .unwrap()
+            .set_len(FILE_CAP + 1)
+            .unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let err = format!("{:#}", capture(src.path(), out.path(), "pbs").unwrap_err());
+        assert!(err.contains("limit"), "{err}");
+
+        let mut big = entry("user.cfg", 0o600);
+        big["size"] = json!(FILE_CAP + 1);
+        let dir = manifest_with(json!([]), json!([big]));
+        let err = format!("{:#}", Manifest::read(dir.path()).unwrap_err());
+        assert!(err.contains("over the limit"), "{err}");
+    }
+
+    #[test]
+    fn fifos_are_classified_and_never_opened() {
+        let src = tempfile::tempdir().unwrap();
+        seed(src.path());
+        let pipe = CString::new(src.path().join("pipe").to_str().unwrap()).unwrap();
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
+        let root = Dir::open(src.path()).unwrap();
+        assert_eq!(
+            root.stat("pipe").unwrap().map(|(k, _)| k),
+            Some(Kind::Other)
+        );
+        assert!(root.file("pipe").is_err());
+        let out = tempfile::tempdir().unwrap();
+        let m = capture(src.path(), out.path(), "pbs").unwrap();
+        assert!(!m.files.iter().any(|f| f.path == "pipe"));
+    }
+
     /// A captured backup laid out as the store writes it.
     fn stored() -> (tempfile::TempDir, PathBuf) {
         let store = tempfile::tempdir().unwrap();
@@ -2469,10 +2947,11 @@ mod tests {
         let slot = store.path().join("pbs-config/pbs/20261004-031000");
         let payload = slot.join("payload");
         fs::create_dir_all(&payload).unwrap();
-        fs::write(slot.join(SLOT_MANIFEST), "{}").unwrap();
         let src = tempfile::tempdir().unwrap();
         seed(src.path());
         capture(src.path(), &payload, "pbs").unwrap();
+        let raw = fs::read(payload.join(MANIFEST)).unwrap();
+        commit(&payload, Some(&format!("sha256:{}", sha256_hex(&raw))));
         (store, payload)
     }
 
