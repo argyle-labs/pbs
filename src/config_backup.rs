@@ -230,20 +230,7 @@ impl Dir {
     /// device node to be swapped in. Without `/proc` this fails closed.
     #[cfg(target_os = "linux")]
     fn file(&self, name: &str) -> io::Result<File> {
-        let path = self.openat(name, libc::O_PATH)?;
-        if !path.metadata()?.is_file() {
-            return Err(not_regular(name));
-        }
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOCTTY | libc::O_CLOEXEC)
-            .open(format!("/proc/self/fd/{}", path.as_raw_fd()))
-            .map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("reopen {name} through /proc/self/fd (is /proc mounted?): {e}"),
-                )
-            })
+        reopen_regular(self.openat(name, libc::O_PATH)?, name)
     }
 
     /// A regular file only: checked before the open and again on the fd.
@@ -426,17 +413,51 @@ fn read_rel(root: &Dir, rel: &str) -> Result<Vec<u8>> {
     read_capped(open_rel(root, rel)?, rel)
 }
 
-/// A file outside any container-writable tree (the store's slot record,
-/// docker's state), still opened without following a final symlink.
-fn read_path(path: &Path) -> Result<Vec<u8>> {
+/// `path`, an `O_PATH` fd, reopened for reading if it is a regular file.
+#[cfg(target_os = "linux")]
+fn reopen_regular(path: File, name: &str) -> io::Result<File> {
+    if !path.metadata()?.is_file() {
+        return Err(not_regular(name));
+    }
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(format!("/proc/self/fd/{}", path.as_raw_fd()))
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("reopen {name} through /proc/self/fd (is /proc mounted?): {e}"),
+            )
+        })
+}
+
+/// A regular file at an absolute path, never following a final symlink and
+/// never opening anything else, as [`Dir::file`] does.
+#[cfg(target_os = "linux")]
+fn open_regular(path: &Path) -> io::Result<File> {
+    let fd = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    reopen_regular(fd, &path.display().to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_regular(path: &Path) -> io::Result<File> {
     let f = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+        .open(path)?;
     if !f.metadata()?.is_file() {
-        bail!("{} is not a regular file", path.display());
+        return Err(not_regular(&path.display().to_string()));
     }
+    Ok(f)
+}
+
+/// A file outside any container-writable tree (the store's slot record,
+/// docker's state).
+fn read_path(path: &Path) -> Result<Vec<u8>> {
+    let f = open_regular(path).with_context(|| format!("open {}", path.display()))?;
     read_capped(f, &path.display().to_string())
 }
 
@@ -1592,10 +1613,18 @@ impl Op {
             } => {
                 discard(&d, staging)?;
                 let mut out = d.create(staging)?;
-                out.write_all(bytes.as_deref().unwrap_or_default())?;
-                apply_meta(&out, file.mode, owners.then_some((file.uid, file.gid)))?;
-                out.sync_all()?;
-                d.rename(staging, to)?;
+                let installed = (|| -> Result<()> {
+                    out.write_all(bytes.as_deref().unwrap_or_default())?;
+                    apply_meta(&out, file.mode, owners.then_some((file.uid, file.gid)))?;
+                    out.sync_all()?;
+                    Ok(d.rename(staging, to)?)
+                })();
+                if let Err(e) = installed {
+                    if let Err(x) = discard(&d, staging) {
+                        tracing::warn!(file = %staging, error = %x, "could not remove a failed install");
+                    }
+                    return Err(e);
+                }
                 discard(&d, from)?;
             }
             Op::Chmod { name, mode, .. } => {
@@ -1625,6 +1654,8 @@ fn unlink(dir: &str, name: impl Into<String>) -> Op {
 /// steps are done.
 struct Finishing {
     manifest: Manifest,
+    /// The canonical slot payload the marker names.
+    slot: PathBuf,
     /// Directories the marker says the restore created that the backup
     /// holds; checked for owner, never chowned.
     created: Vec<String>,
@@ -1642,7 +1673,7 @@ fn finishing_manifest(
     name: &str,
     instance: &str,
     untrusted: &Path,
-) -> Result<Manifest> {
+) -> Result<(Manifest, PathBuf)> {
     let (Some(payload), Some(checksum), Some(recorded)) = (
         &marker.slot_payload,
         &marker.slot_checksum,
@@ -1652,11 +1683,11 @@ fn finishing_manifest(
     };
     let verified = store_payload(payload).and_then(|p| {
         if p.starts_with(fs::canonicalize(untrusted)?) {
-            bail!("it lies inside the container's own volumes");
+            bail!("it lies inside docker's data root, which the container can write");
         }
-        verified_slot(&p)
+        Ok((verified_slot(&p)?, p))
     });
-    let (manifest, got) = verified.with_context(|| {
+    let ((manifest, got), slot) = verified.with_context(|| {
         format!(
             "{name} names the backup at {payload}, which cannot be verified; only rollback applies"
         )
@@ -1670,11 +1701,31 @@ fn finishing_manifest(
             manifest.instance
         );
     }
-    Ok(manifest)
+    Ok((manifest, slot))
 }
 
-/// The steps that settle every interrupted restore of `instance` in `dest`,
-/// whose container can write anywhere under `untrusted`.
+/// `finish` acts only on the backup the operator names, and only if it is
+/// the one the marker records.
+fn match_payload(slot: &Path, payload: Option<&str>) -> Result<()> {
+    let Some(payload) = payload else {
+        bail!(
+            "finish needs --payload naming the backup it completes; the marker records {}",
+            slot.display()
+        );
+    };
+    let given = fs::canonicalize(payload).with_context(|| format!("resolve {payload}"))?;
+    if given != slot {
+        bail!(
+            "--payload {payload} is not the backup the interrupted restore used ({}); refusing",
+            slot.display()
+        );
+    }
+    Ok(())
+}
+
+/// The steps that settle every interrupted restore of `instance` in `dest`.
+/// `untrusted` is docker's data root: its volumes and overlay layers are all
+/// container-writable, so a backup slot under it is never trusted.
 ///
 /// A marker in [`Phase::Swapping`] can be finished (staged files moved into
 /// place) or rolled back (originals put back). [`Phase::Staging`] and
@@ -1737,7 +1788,7 @@ fn recovery(
                     dest.display()
                 );
             }
-            let manifest = finishing_manifest(&m, &l.name, instance, untrusted)?;
+            let (manifest, slot) = finishing_manifest(&m, &l.name, instance, untrusted)?;
             let created = m
                 .created_dirs
                 .iter()
@@ -1746,6 +1797,7 @@ fn recovery(
                 .collect();
             finishing = Some(Finishing {
                 manifest,
+                slot,
                 created,
                 owners: m.owners,
             });
@@ -1864,14 +1916,26 @@ fn recovery(
 #[derive(Debug)]
 struct Recovered {
     steps: Vec<String>,
+    /// The backup a finish completed from.
+    slot: Option<String>,
     /// Of the finished restore; `None` after a rollback.
     verification: Option<Verification>,
 }
 
 /// Apply [`recovery`] and fsync what it touched. A `finish` then verifies
 /// the restored config as a restore does.
-fn recover(dest: &Path, instance: &str, untrusted: &Path, finish: bool) -> Result<Recovered> {
+/// `payload` is required for a finish and must be the marker's slot.
+fn recover(
+    dest: &Path,
+    instance: &str,
+    untrusted: &Path,
+    finish: bool,
+    payload: Option<&str>,
+) -> Result<Recovered> {
     let (root, ops, finishing) = recovery(dest, instance, untrusted, finish)?;
+    if let Some(f) = &finishing {
+        match_payload(&f.slot, payload)?;
+    }
     // Every staged file is checked before anything changes, so a mismatch
     // leaves the restore as it was and rollback still has every original.
     for op in &ops {
@@ -1891,6 +1955,7 @@ fn recover(dest: &Path, instance: &str, untrusted: &Path, finish: bool) -> Resul
             dir.0.sync_all()?;
         }
     }
+    let slot = finishing.as_ref().map(|f| f.slot.display().to_string());
     let verification = match finishing {
         Some(f) => {
             let mut v = verify(dest, &f.manifest);
@@ -1911,6 +1976,7 @@ fn recover(dest: &Path, instance: &str, untrusted: &Path, finish: bool) -> Resul
     };
     Ok(Recovered {
         steps: done,
+        slot,
         verification,
     })
 }
@@ -2005,12 +2071,14 @@ impl PbsConfigKind {
             .join("_data"))
     }
 
-    /// Docker keeps container state in `containers/` beside `volumes/`.
+    /// Docker's data root, holding `volumes/`, `containers/` and the image
+    /// layers; all of it is writable from some container.
+    fn data_root(&self) -> &Path {
+        self.volume_root.parent().unwrap_or(&self.volume_root)
+    }
+
     fn containers_dir(&self) -> PathBuf {
-        self.volume_root
-            .parent()
-            .unwrap_or(&self.volume_root)
-            .join("containers")
+        self.data_root().join("containers")
     }
 
     fn ensure_stopped(&self, instance: &str) -> Result<()> {
@@ -2284,9 +2352,11 @@ pub struct ConfigRestoreOutput {
 
 /// Resolve `payload` and require it to be a `pbs-config` slot inside a
 /// backup store: `<root>/pbs-config/<instance>/<id>/payload`, where `<root>`
-/// holds the store's stage lock and the slot its manifest. This catches an
-/// operator pointing at the wrong directory; it is not a security boundary,
-/// since the caller is already an admin.
+/// holds the store's stage lock and the slot its manifest, both regular
+/// files. For `pbs.config_restore` this only catches an admin pointing at
+/// the wrong directory. Recovery also uses it on a path read from the
+/// container-writable marker; there it is one check of several, and the
+/// boundary is the exclusion of docker's data root in `finishing_manifest`.
 fn store_payload(payload: &str) -> Result<PathBuf> {
     let p = fs::canonicalize(payload).with_context(|| format!("resolve {payload}"))?;
     let refuse = || anyhow!("{payload} is not a {KIND} backup payload inside a backup store");
@@ -2297,14 +2367,14 @@ fn store_payload(payload: &str) -> Result<PathBuf> {
     let root = slot
         .ancestors()
         .nth(3)
-        .filter(|r| r.join(STAGE_LOCK_FILE).is_file())
+        .filter(|r| open_regular(&r.join(STAGE_LOCK_FILE)).is_ok())
         .ok_or_else(refuse)?;
     let kind_dir = p
         .strip_prefix(root)
         .ok()
         .and_then(|r| r.components().next());
     if kind_dir != Some(std::path::Component::Normal(KIND.as_ref()))
-        || !slot.join(SLOT_MANIFEST).is_file()
+        || open_regular(&slot.join(SLOT_MANIFEST)).is_err()
     {
         return Err(refuse());
     }
@@ -2409,6 +2479,11 @@ pub struct ConfigRecoverArgs {
     /// `rollback` puts the originals back; `finish` completes the restore.
     #[arg(long)]
     pub action: String,
+    /// For `finish`: the backup payload the interrupted restore used, as the
+    /// dry run reports it. Must match the one its marker records.
+    #[arg(long)]
+    #[serde(default)]
+    pub payload: Option<String>,
     /// Apply the change. Without it the verb lists the steps.
     #[arg(long)]
     #[serde(default)]
@@ -2422,6 +2497,10 @@ pub struct ConfigRecoverOutput {
     pub dry_run: bool,
     /// Planned on a dry run; applied on execute.
     pub steps: Vec<String>,
+    /// For `finish`: the backup payload the marker records, which
+    /// `--payload` must name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
     /// The finished config's verification, as a restore reports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<Verification>,
@@ -2456,31 +2535,39 @@ fn config_recover(
         other => bail!("{TOOL}: action must be rollback or finish, not {other:?}"),
     };
     let live = kind.config_dir(&args.instance)?;
+    let payload = args.payload.as_deref();
     if !args.execute {
-        let steps: Vec<String> = recovery(&live, &args.instance, &kind.volume_root, finish)?
-            .1
-            .iter()
-            .map(Op::describe)
-            .collect();
+        let (_, ops, finishing) = recovery(&live, &args.instance, kind.data_root(), finish)?;
+        let slot = finishing.map(|f| f.slot);
+        if let (Some(slot), Some(_)) = (&slot, payload) {
+            match_payload(slot, payload)?;
+        }
+        let steps: Vec<String> = ops.iter().map(Op::describe).collect();
         let changes = steps
             .iter()
             .map(|s| PlannedChange::new(s.clone(), args.action.clone()))
             .collect();
+        let mut summary = format!("{} {}", args.action, live.display());
+        if let Some(slot) = &slot {
+            summary.push_str(&format!(" from the backup at {}", slot.display()));
+        }
         let plan = ExecutionPlan::generic(TOOL, serde_json::to_value(args)?.into())
-            .detailed(format!("{} {}", args.action, live.display()), changes);
+            .detailed(summary, changes);
         return Ok(ConfigRecoverOutput {
             dry_run: true,
             steps,
+            slot: slot.map(|s| s.display().to_string()),
             verification: None,
             plan: Some(plan),
         });
     }
     plan::authorize_execute(TOOL, caller)?;
     kind.ensure_stopped(&args.instance)?;
-    let done = recover(&live, &args.instance, &kind.volume_root, finish)?;
+    let done = recover(&live, &args.instance, kind.data_root(), finish, payload)?;
     Ok(ConfigRecoverOutput {
         dry_run: false,
         steps: done.steps,
+        slot: done.slot,
         verification: done.verification,
         plan: None,
     })
@@ -3145,7 +3232,7 @@ mod tests {
         let err = materialize(payload.path(), live.path(), &m, false).unwrap_err();
         assert!(format!("{err:#}").contains("pbs.config_recover"), "{err:#}");
 
-        recover(live.path(), "pbs", live.path(), false).unwrap();
+        recover(live.path(), "pbs", live.path(), false, None).unwrap();
         assert_all(live.path(), &m, |_| "live\n".to_string());
         assert!(
             all_leftovers(live.path()).is_empty(),
@@ -3170,7 +3257,8 @@ mod tests {
             plan.contains(&"set mode of directory acme to 750".to_string()),
             "{plan:?}"
         );
-        let v = recover(live.path(), "pbs", live.path(), true)
+        let slot = payload.path().to_str();
+        let v = recover(live.path(), "pbs", live.path(), true, slot)
             .unwrap()
             .verification
             .unwrap();
@@ -3184,6 +3272,69 @@ mod tests {
             staged
         );
         assert!(all_leftovers(live.path()).is_empty());
+    }
+
+    #[test]
+    fn finish_names_the_slot_and_needs_it_as_payload() {
+        let (tmp, kind, live) = host("pbs");
+        container(tmp.path(), "abc", pbs_state(false));
+        let (_store, payload) = stored();
+        let (_other_store, other) = stored();
+        let m = Manifest::read(&payload).unwrap();
+        crash_mid_swap(&live, &payload, &m);
+        let slot = fs::canonicalize(&payload).unwrap().display().to_string();
+        let args = |payload: Option<&Path>, execute| ConfigRecoverArgs {
+            instance: "pbs".into(),
+            action: "finish".into(),
+            payload: payload.map(|p| p.display().to_string()),
+            execute,
+        };
+        let admin = plan::admin();
+
+        let out = config_recover(&kind, &args(None, false), None).unwrap();
+        assert_eq!(out.slot.as_deref(), Some(slot.as_str()));
+        let plan = serde_json::to_string(&out.plan).unwrap();
+        assert!(
+            plan.contains(&format!("from the backup at {slot}")),
+            "{plan}"
+        );
+
+        let err = format!(
+            "{:#}",
+            config_recover(&kind, &args(None, true), Some(&admin)).unwrap_err()
+        );
+        assert!(err.contains("finish needs --payload"), "{err}");
+        let err = format!(
+            "{:#}",
+            config_recover(&kind, &args(Some(&other), true), Some(&admin)).unwrap_err()
+        );
+        assert!(
+            err.contains("is not the backup the interrupted restore used"),
+            "{err}"
+        );
+        assert!(!all_leftovers(&live).is_empty());
+
+        let out = config_recover(&kind, &args(Some(&payload), true), Some(&admin)).unwrap();
+        assert_eq!(out.slot.as_deref(), Some(slot.as_str()));
+        assert!(out.verification.unwrap().ok());
+        assert!(all_leftovers(&live).is_empty());
+    }
+
+    #[test]
+    fn a_failed_install_removes_its_staging_file() {
+        let (live, payload, m) = drifted();
+        let l = live.path();
+        crash_mid_swap(l, payload.path(), &m);
+        fs::remove_file(l.join("authkey.key")).unwrap();
+        fs::create_dir(l.join("authkey.key")).unwrap();
+        fs::write(l.join("authkey.key/x"), "").unwrap();
+        let err = recover(l, "pbs", l, true, payload.path().to_str()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("install authkey.key"),
+            "{err:#}"
+        );
+        assert!(!l.join(".authkey.key.orca-restore-T.install").exists());
+        assert!(l.join(".authkey.key.orca-restore-T").exists());
     }
 
     fn rewrite_marker(live: &Path, edit: impl FnOnce(&mut SwapMarker)) {
@@ -3210,18 +3361,18 @@ mod tests {
             f.sha256 = sha256_hex(planted.as_bytes());
             f.size = planted.len() as u64;
         });
-        let err = format!("{:#}", recover(l, "pbs", l, true).unwrap_err());
+        let err = format!("{:#}", recover(l, "pbs", l, true, None).unwrap_err());
         assert!(err.contains("does not match the backup"), "{err}");
         assert_eq!(fs::read_to_string(l.join("authkey.key")).unwrap(), "live\n");
 
         rewrite_marker(l, |marker| marker.slot_payload = None);
-        let err = format!("{:#}", recover(l, "pbs", l, true).unwrap_err());
+        let err = format!("{:#}", recover(l, "pbs", l, true, None).unwrap_err());
         assert!(err.contains("records no backup slot"), "{err}");
 
         rewrite_marker(l, |marker| {
             marker.slot_payload = Some(l.join("nowhere").display().to_string())
         });
-        let err = format!("{:#}", recover(l, "pbs", l, true).unwrap_err());
+        let err = format!("{:#}", recover(l, "pbs", l, true, None).unwrap_err());
         assert!(err.contains("cannot be verified"), "{err}");
 
         // A self-consistent slot the container built inside its own volume.
@@ -3232,12 +3383,12 @@ mod tests {
             marker.slot_checksum = Some(format!("sha256:{}", sha256_hex(&raw)));
             marker.manifest = Some(Manifest::read(&fake).unwrap());
         });
-        let err = format!("{:#}", recover(l, "pbs", l, true).unwrap_err());
-        assert!(err.contains("inside the container's own volumes"), "{err}");
+        let err = format!("{:#}", recover(l, "pbs", l, true, None).unwrap_err());
+        assert!(err.contains("inside docker's data root"), "{err}");
         fs::remove_dir_all(l.join("acme/pbs-config")).unwrap();
         fs::remove_file(l.join("acme").join(STAGE_LOCK_FILE)).unwrap();
 
-        recover(l, "pbs", l, false).unwrap();
+        recover(l, "pbs", l, false, None).unwrap();
         assert_all(l, &m, |_| "live\n".to_string());
     }
 
@@ -3247,7 +3398,7 @@ mod tests {
         crash_mid_swap(live.path(), payload.path(), &m);
         let err = format!(
             "{:#}",
-            recover(live.path(), "other", live.path(), true).unwrap_err()
+            recover(live.path(), "other", live.path(), true, None).unwrap_err()
         );
         assert!(err.contains("not \"other\""), "{err}");
     }
@@ -3261,7 +3412,7 @@ mod tests {
         fs::write(l.join(".orca-swap-P"), marker.to_string()).unwrap();
         let (_, ops, _) = recovery(l, "pbs", l, false).unwrap();
         assert!(!ops.contains(&unlink("", "authkey.key")), "{ops:?}");
-        recover(l, "pbs", l, false).unwrap();
+        recover(l, "pbs", l, false, None).unwrap();
         assert_eq!(fs::read_to_string(l.join("authkey.key")).unwrap(), "live\n");
         assert!(all_leftovers(l).is_empty());
     }
@@ -3277,7 +3428,7 @@ mod tests {
         fs::write(l.join(".orca-swap-S"), marker.to_string()).unwrap();
         std::os::unix::fs::symlink(outside.path().join("bait"), l.join(".user.cfg.orca-prev-S"))
             .unwrap();
-        let err = format!("{:#}", recover(l, "pbs", l, false).unwrap_err());
+        let err = format!("{:#}", recover(l, "pbs", l, false, None).unwrap_err());
         assert!(err.contains("is a symlink"), "{err}");
         assert_eq!(fs::read_to_string(l.join("user.cfg")).unwrap(), "live\n");
     }
@@ -3334,6 +3485,7 @@ mod tests {
             let args = ConfigRecoverArgs {
                 instance: bad.into(),
                 action: "rollback".into(),
+                payload: None,
                 execute: false,
             };
             assert!(config_recover(&kind, &args, None).is_err(), "{bad:?}");
@@ -3347,16 +3499,17 @@ mod tests {
         crash_mid_swap(live.path(), payload.path(), &m);
         let staged = live.path().join(".authkey.key.orca-restore-T");
         fs::write(&staged, "planted\n").unwrap();
+        let slot = payload.path().to_str();
         let err = format!(
             "{:#}",
-            recover(live.path(), "pbs", live.path(), true).unwrap_err()
+            recover(live.path(), "pbs", live.path(), true, slot).unwrap_err()
         );
         assert!(err.contains("does not match the backup manifest"), "{err}");
         assert_eq!(
             fs::read_to_string(live.path().join("authkey.key")).unwrap(),
             "live\n"
         );
-        recover(live.path(), "pbs", live.path(), false).unwrap();
+        recover(live.path(), "pbs", live.path(), false, None).unwrap();
         assert_all(live.path(), &m, |_| "live\n".to_string());
         assert!(all_leftovers(live.path()).is_empty());
     }
@@ -3394,7 +3547,11 @@ mod tests {
             serde_json::from_slice(&fs::read(l.join(format!("{SWAP_MARK}T"))).unwrap()).unwrap();
         assert_eq!(marker.phase, Phase::Swapping);
 
-        let v = recover(l, "pbs", l, true).unwrap().verification.unwrap();
+        let slot = payload.path().to_str();
+        let v = recover(l, "pbs", l, true, slot)
+            .unwrap()
+            .verification
+            .unwrap();
         assert!(v.ok(), "{:?}", v.problems);
         assert_all(l, &m, want);
         assert!(verify_meta(l, &m, &[]).is_empty());
@@ -3466,7 +3623,7 @@ mod tests {
         let (live, _payload, m) = drifted();
         fs::write(live.path().join(".user.cfg.orca-restore-X"), "partial").unwrap();
         fs::write(live.path().join("acme/.accounts.orca-prev-X"), "old").unwrap();
-        let steps = recover(live.path(), "pbs", live.path(), true)
+        let steps = recover(live.path(), "pbs", live.path(), true, None)
             .unwrap()
             .steps;
         assert_eq!(steps.len(), 2, "{steps:?}");
@@ -3483,6 +3640,7 @@ mod tests {
         let args = |action: &str, execute| ConfigRecoverArgs {
             instance: "pbs".into(),
             action: action.into(),
+            payload: None,
             execute,
         };
         let before = all_leftovers(&live);
@@ -3518,10 +3676,10 @@ mod tests {
         assert!(r.is_err());
         let err = format!(
             "{:#}",
-            recover(live.path(), "pbs", live.path(), true).unwrap_err()
+            recover(live.path(), "pbs", live.path(), true, None).unwrap_err()
         );
         assert!(err.contains("only rollback"), "{err}");
-        recover(live.path(), "pbs", live.path(), false).unwrap();
+        recover(live.path(), "pbs", live.path(), false, None).unwrap();
         assert_all(live.path(), &m, |_| "live\n".to_string());
         assert!(all_leftovers(live.path()).is_empty());
     }
@@ -3537,9 +3695,9 @@ mod tests {
         fs::write(l.join("acme/.accounts.orca-restore-S"), "partial").unwrap();
         fs::write(l.join(".user.cfg.orca-restore-S"), "partial").unwrap();
 
-        let err = format!("{:#}", recover(l, "pbs", l, true).unwrap_err());
+        let err = format!("{:#}", recover(l, "pbs", l, true, None).unwrap_err());
         assert!(err.contains("still staging"), "{err}");
-        recover(l, "pbs", l, false).unwrap();
+        recover(l, "pbs", l, false, None).unwrap();
         assert!(!l.join("acme").exists());
         assert!(all_leftovers(l).is_empty());
         assert_eq!(fs::read_to_string(l.join("user.cfg")).unwrap(), "live\n");
@@ -3562,7 +3720,7 @@ mod tests {
             !ops.iter().any(|o| matches!(o, Op::Rename { .. })),
             "{ops:?}"
         );
-        recover(l, "pbs", l, false).unwrap();
+        recover(l, "pbs", l, false, None).unwrap();
         assert_eq!(fs::read_to_string(l.join("user.cfg")).unwrap(), "live\n");
         assert!(all_leftovers(l).is_empty());
     }
@@ -3573,7 +3731,7 @@ mod tests {
         fs::write(live.path().join("acme/.orca-swap-X"), "not a marker").unwrap();
         let (_, ops, _) = recovery(live.path(), "pbs", live.path(), true).unwrap();
         assert_eq!(ops, [unlink("acme", ".orca-swap-X")]);
-        recover(live.path(), "pbs", live.path(), true).unwrap();
+        recover(live.path(), "pbs", live.path(), true, None).unwrap();
         assert!(all_leftovers(live.path()).is_empty());
     }
 
@@ -3584,7 +3742,7 @@ mod tests {
         assert!(materialize(payload.path(), live.path(), &m, false).is_err());
         let err = format!(
             "{:#}",
-            recover(live.path(), "pbs", live.path(), false).unwrap_err()
+            recover(live.path(), "pbs", live.path(), false, None).unwrap_err()
         );
         assert!(err.contains("remove them by hand"), "{err}");
     }
