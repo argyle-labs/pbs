@@ -104,11 +104,7 @@ impl Identity {
 /// Host names become a PBS user name and a namespace component, so they must
 /// satisfy both.
 pub fn validate_host(host: &str) -> Result<()> {
-    let mut chars = host.chars();
-    let ok = (1..=32).contains(&host.len())
-        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if !ok {
+    if !crate::plain_name(host, 32) {
         bail!("invalid host '{host}': must match ^[A-Za-z0-9][A-Za-z0-9_-]{{0,31}}$");
     }
     if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(host)) {

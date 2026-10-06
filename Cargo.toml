@@ -20,10 +20,13 @@ path = "src/main.rs"
 # reaching orca through plugin-toolkit alone.
 [dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
-# The one crate outside the toolkit: a custom certificate verifier that pins
+# Outside the toolkit: a custom certificate verifier that pins
 # PBS's self-signed cert by fingerprint, handed to reqwest as a preconfigured
 # rustls config. Same version reqwest already links.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# O_NOFOLLOW for reading and writing PBS config files as root inside a
+# volume the container can plant symlinks in.
+libc = "0.2"
 
 [dev-dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
