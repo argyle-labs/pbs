@@ -221,9 +221,32 @@ impl Dir {
             .map(Dir)
     }
 
-    /// A regular file only: checked before the open and again on the fd, so
-    /// something swapped in between is refused. `O_NONBLOCK` keeps a FIFO
-    /// that slips through from hanging the open.
+    /// A regular file only. On Linux the name is resolved once with
+    /// `O_PATH`, which opens nothing, its type checked on that fd, and the
+    /// same inode reopened through `/proc/self/fd`; there is no window for a
+    /// device node to be swapped in. Without `/proc` this fails closed.
+    #[cfg(target_os = "linux")]
+    fn file(&self, name: &str) -> io::Result<File> {
+        let path = self.openat(name, libc::O_PATH)?;
+        if !path.metadata()?.is_file() {
+            return Err(not_regular(name));
+        }
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_CLOEXEC)
+            .open(format!("/proc/self/fd/{}", path.as_raw_fd()))
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("reopen {name} through /proc/self/fd (is /proc mounted?): {e}"),
+                )
+            })
+    }
+
+    /// A regular file only: checked before the open and again on the fd.
+    /// `O_NONBLOCK|O_NOCTTY` limit what a device node swapped in between can
+    /// do; Linux closes that window with `O_PATH`.
+    #[cfg(not(target_os = "linux"))]
     fn file(&self, name: &str) -> io::Result<File> {
         match self.stat(name)? {
             Some((Kind::File, _)) => {}
@@ -299,6 +322,7 @@ impl Dir {
         // SAFETY: `dirp` is a valid DIR stream until closedir below.
         unsafe { libc::rewinddir(dirp) };
         let mut out = Vec::new();
+        let mut not_utf8 = None;
         loop {
             // SAFETY: `dirp` is valid; the entry is read before the next call.
             let ent = unsafe { libc::readdir(dirp) };
@@ -306,15 +330,26 @@ impl Dir {
                 break;
             }
             // SAFETY: readdir returned a valid entry with a NUL-terminated name.
-            let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) }
-                .to_string_lossy()
-                .into_owned();
-            if name != "." && name != ".." {
-                out.push(name);
+            let raw = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
+            match raw.to_str() {
+                Ok("." | "..") => {}
+                Ok(name) => out.push(name.to_string()),
+                Err(_) => {
+                    not_utf8 = Some(raw.to_string_lossy().into_owned());
+                    break;
+                }
             }
         }
         // SAFETY: `dirp` came from fdopendir and is closed once.
         unsafe { libc::closedir(dirp) };
+        // A lossy name would name a different file, so refuse rather than
+        // skip or mangle it.
+        if let Some(name) = not_utf8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{name:?} is not a valid UTF-8 name; rename or remove it first"),
+            ));
+        }
         out.sort();
         Ok(out)
     }
@@ -464,12 +499,17 @@ impl Manifest {
     /// no mode may carry setuid, setgid or sticky bits; and no file may
     /// exceed the read caps.
     fn parse(raw: &[u8], payload: &Path) -> Result<Self> {
-        let at = || payload.join(MANIFEST).display().to_string();
-        let m: Manifest = serde_json::from_slice(raw).with_context(|| format!("parse {}", at()))?;
+        let at = payload.join(MANIFEST).display().to_string();
+        let m: Manifest = serde_json::from_slice(raw).with_context(|| format!("parse {at}"))?;
+        m.validate(&at)?;
+        Ok(m)
+    }
+
+    fn validate(&self, at: &str) -> Result<()> {
+        let m = self;
         if m.version != MANIFEST_VERSION {
             bail!(
-                "{}: manifest version {} is not {MANIFEST_VERSION}",
-                at(),
+                "{at}: manifest version {} is not {MANIFEST_VERSION}",
                 m.version
             );
         }
@@ -510,14 +550,17 @@ impl Manifest {
         if total > TOTAL_CAP {
             bail!("manifest totals {total} bytes, over the {TOTAL_CAP}-byte limit");
         }
-        Ok(m)
+        Ok(())
     }
 }
 
+/// What the slot checksum does and does not prove, stated in restore output.
+pub const CHECKSUM_SCOPE: &str = "the backup checksum is stored in the backup store beside the backup, so it detects corruption but not tampering by anyone who can write to the store; orca#478 will hold it in orca's database or key it";
+
 /// The payload's manifest, accepted only if it hashes to the checksum the
 /// backup record holds for it. The record is `manifest.json` in the slot
-/// beside `payload/`; a missing checksum is refused like a wrong one.
-/// orca verifying slot checksums itself is orca#478.
+/// beside `payload/`; a missing checksum is refused like a wrong one. See
+/// [`CHECKSUM_SCOPE`] for what that proves.
 pub fn verified_manifest(payload: &Path) -> Result<Manifest> {
     let slot = payload
         .parent()
@@ -652,8 +695,9 @@ struct Snapshot {
     files: Vec<(FileEntry, Vec<u8>)>,
 }
 
-/// Copy `source` into `payload/files` and write the manifest.
-pub fn capture(source: &Path, payload: &Path, instance: &str) -> Result<Manifest> {
+/// Copy `source` into `payload/files` and write the manifest. Returns the
+/// manifest and the exact bytes written for it.
+pub fn capture(source: &Path, payload: &Path, instance: &str) -> Result<(Manifest, Vec<u8>)> {
     capture_with(source, payload, instance, &|| {})
 }
 
@@ -665,7 +709,7 @@ fn capture_with(
     payload: &Path,
     instance: &str,
     after_read: &dyn Fn(),
-) -> Result<Manifest> {
+) -> Result<(Manifest, Vec<u8>)> {
     let src = Dir::open(source)?;
     let snapshot = {
         let _locks = hold_locks(&src)?;
@@ -692,11 +736,12 @@ fn capture_with(
             .and_then(|()| to.sync_all())
             .with_context(|| format!("write {}", f.path))?;
     }
+    let raw = serde_json::to_vec_pretty(&manifest)?;
     let mut f = out.create(MANIFEST)?;
-    f.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
+    f.write_all(&raw)?;
     f.sync_all()?;
     out.0.sync_all()?;
-    Ok(manifest)
+    Ok((manifest, raw))
 }
 
 fn read_snapshot(src: &Dir, after_read: &dyn Fn()) -> Result<Snapshot> {
@@ -950,6 +995,12 @@ struct SwapMarker {
     phase: Phase,
     files: Vec<MarkedFile>,
     created_dirs: Vec<String>,
+    /// Whether recorded owners are applied, as the restore was asked.
+    #[serde(default)]
+    owners: bool,
+    /// What `finish` checks each staged file against before installing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manifest: Option<Manifest>,
 }
 
 #[orca_struct]
@@ -997,12 +1048,16 @@ pub fn materialize(
 struct Work<'a> {
     root: Dir,
     tag: &'a str,
+    manifest: &'a Manifest,
     owners: bool,
     phase: Phase,
     created: Vec<String>,
     staged: Vec<Staged>,
     marker: Option<String>,
     failures: Vec<String>,
+    /// The rollback could not be recorded, so the marker still says
+    /// [`Phase::Swapping`] and the tree is left for [`recover`] untouched.
+    stranded: bool,
 }
 
 fn materialize_with(
@@ -1026,12 +1081,14 @@ fn materialize_with(
     let mut w = Work {
         root,
         tag,
+        manifest,
         owners,
         phase: Phase::Staging,
         created: Vec::new(),
         staged: Vec::new(),
         marker: None,
         failures: Vec::new(),
+        stranded: false,
     };
     let result = w
         .write_marker()
@@ -1045,7 +1102,7 @@ fn materialize_with(
         .and_then(|()| w.swap(rename));
     match result {
         Ok(()) => {
-            w.finish(manifest)?;
+            w.finish()?;
             Ok(w.created)
         }
         Err(e) => {
@@ -1076,13 +1133,23 @@ impl Work<'_> {
                 })
                 .collect(),
             created_dirs: self.created.clone(),
+            owners: self.owners,
+            manifest: Some(self.manifest.clone()),
         };
+        let raw = serde_json::to_vec(&marker)?;
         let name = format!("{SWAP_MARK}{}", self.tag);
         let next = format!("{name}{NEXT_SUFFIX}");
         let mut f = self.root.create(&next)?;
-        f.write_all(&serde_json::to_vec(&marker)?)?;
-        f.sync_all()?;
-        self.root.rename(&next, &name)?;
+        let written = f
+            .write_all(&raw)
+            .and_then(|()| f.sync_all())
+            .and_then(|()| self.root.rename(&next, &name));
+        if let Err(e) = written {
+            if let Err(d) = discard(&self.root, &next) {
+                tracing::warn!(file = %next, error = %d, "could not remove a failed marker update");
+            }
+            return Err(e.into());
+        }
         self.marker = Some(name);
         self.root.0.sync_all()?;
         Ok(())
@@ -1158,7 +1225,9 @@ impl Work<'_> {
     }
 
     /// The marker turns to [`Phase::RollingBack`] before the first file is
-    /// put back, so recovery after a crash here can only roll back.
+    /// put back, so recovery after a crash here can only roll back. If that
+    /// cannot be recorded nothing is put back: a `finish` over a marker
+    /// still saying [`Phase::Swapping`] would leave the put-back files old.
     fn swap(&mut self, rename: Rename) -> Result<()> {
         for i in 0..self.staged.len() {
             let s = &self.staged[i];
@@ -1166,8 +1235,13 @@ impl Work<'_> {
                 let failed = s.rel.clone();
                 self.phase = Phase::RollingBack;
                 if let Err(m) = self.write_marker() {
-                    self.failures
-                        .push(format!("could not mark the rollback: {m:#}"));
+                    self.phase = Phase::Swapping;
+                    self.stranded = true;
+                    return Err(e).with_context(|| {
+                        format!(
+                            "replace {failed}; could not record the rollback ({m:#}), so nothing was put back; settle it with pbs.config_recover (action finish or rollback)"
+                        )
+                    });
                 }
                 for s in self.staged[..i].iter_mut().rev() {
                     let back = match &s.prev {
@@ -1192,7 +1266,7 @@ impl Work<'_> {
 
     /// Drop the marker first: from then on the restored files are the
     /// consistent state and the set-aside originals are disposable.
-    fn finish(&mut self, manifest: &Manifest) -> Result<()> {
+    fn finish(&mut self) -> Result<()> {
         self.sync_dirs()?;
         if let Some(m) = self.marker.take() {
             self.root.unlink(&m)?;
@@ -1205,20 +1279,15 @@ impl Work<'_> {
                 }
             }
         }
-        for d in &manifest.dirs {
-            let owner = if self.created.contains(&d.path) {
-                self.owner(d.uid, d.gid)
-            } else {
-                None
-            };
-            apply_meta(&open_dir(&self.root, &d.path)?.0, d.mode, owner)
-                .with_context(|| format!("files restored, but setting {} failed", d.path))?;
-        }
+        apply_dir_meta(&self.root, self.manifest, &self.created, self.owners)?;
         self.sync_dirs()
     }
 
     /// Clean up after a reported error. Returns what could not be undone.
     fn undo(&mut self) -> Vec<String> {
+        if self.stranded {
+            return Vec::new();
+        }
         let mut left = std::mem::take(&mut self.failures);
         for s in &self.staged {
             if let Err(e) = discard(&s.dir, &s.tmp) {
@@ -1242,15 +1311,17 @@ impl Work<'_> {
                 left.push(format!("could not remove created directory {d}: {e:#}"));
             }
         }
+        // The marker goes only once the rollback is durable.
+        if let Err(e) = self.sync_dirs() {
+            left.push(format!("fsync after rollback: {e:#}"));
+        }
         if left.is_empty() {
             if let Some(m) = self.marker.take() {
-                if let Err(e) = discard(&self.root, &m) {
+                let removed = discard(&self.root, &m).and_then(|()| self.root.0.sync_all());
+                if let Err(e) = removed {
                     left.push(format!("could not remove {m}: {e}"));
                 }
             }
-        }
-        if let Err(e) = self.sync_dirs() {
-            left.push(format!("fsync after rollback: {e:#}"));
         }
         left
     }
@@ -1262,6 +1333,17 @@ impl Work<'_> {
         self.root.0.sync_all()?;
         Ok(())
     }
+}
+
+/// Each directory's recorded mode, and its owner too if the restore created
+/// it and applies owners.
+fn apply_dir_meta(root: &Dir, manifest: &Manifest, created: &[String], owners: bool) -> Result<()> {
+    for d in &manifest.dirs {
+        let owner = (owners && created.contains(&d.path)).then_some((d.uid, d.gid));
+        apply_meta(&open_dir(root, &d.path)?.0, d.mode, owner)
+            .with_context(|| format!("files restored, but setting {} failed", d.path))?;
+    }
+    Ok(())
 }
 
 /// A file a restore leaves behind while it runs.
@@ -1329,10 +1411,12 @@ fn leftovers_at(dir: &Dir, rel_dir: &str, out: &mut Vec<Left>) -> Result<()> {
 /// config dir and `name` a single component, so no step acts through a path.
 #[derive(Debug, Clone, PartialEq)]
 enum Op {
+    /// With `sha256`, `from` is installed only if its contents hash to it.
     Rename {
         dir: String,
         from: String,
         to: String,
+        sha256: Option<String>,
     },
     Unlink {
         dir: String,
@@ -1347,9 +1431,21 @@ enum Op {
 impl Op {
     fn describe(&self) -> String {
         match self {
-            Op::Rename { dir, from, to } => {
-                format!("rename {} to {}", join_rel(dir, from), join_rel(dir, to))
-            }
+            Op::Rename {
+                dir,
+                from,
+                to,
+                sha256,
+            } => format!(
+                "rename {} to {}{}",
+                join_rel(dir, from),
+                join_rel(dir, to),
+                if sha256.is_some() {
+                    " once it matches the manifest"
+                } else {
+                    ""
+                }
+            ),
             Op::Unlink { dir, name } => format!("remove {}", join_rel(dir, name)),
             Op::Rmdir { dir, name } => format!("remove directory {}", join_rel(dir, name)),
         }
@@ -1361,7 +1457,28 @@ impl Op {
         }
     }
 
+    /// A checked rename's source still hashes to the manifest.
+    fn check(&self, root: &Dir) -> Result<()> {
+        if let Op::Rename {
+            dir,
+            from,
+            sha256: Some(want),
+            ..
+        } = self
+        {
+            let f = open_dir(root, dir)?.file(from)?;
+            if &sha256_hex(&read_capped(f, from)?) != want {
+                bail!(
+                    "{} does not match the backup manifest; not installed",
+                    join_rel(dir, from)
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn apply(&self, root: &Dir) -> Result<()> {
+        self.check(root)?;
         let d = open_dir(root, self.dir())?;
         match self {
             Op::Rename { from, to, .. } => d.rename(from, to)?,
@@ -1382,14 +1499,24 @@ fn unlink(dir: &str, name: impl Into<String>) -> Op {
     }
 }
 
+/// The restore a `finish` completes, for re-applying directory modes and
+/// verifying the result once its steps are done.
+struct Finishing {
+    manifest: Manifest,
+    created: Vec<String>,
+    owners: bool,
+}
+
 /// The steps that settle every interrupted restore in `dest`.
 ///
 /// A marker in [`Phase::Swapping`] can be finished (staged files moved into
 /// place) or rolled back (originals put back). [`Phase::Staging`] and
 /// [`Phase::RollingBack`] can only be rolled back. Leftovers whose tag has no
 /// marker belong to no live operation and are removed either way. Created
-/// directories are removed on rollback once empty.
-fn recovery(dest: &Path, finish: bool) -> Result<(Dir, Vec<Op>)> {
+/// directories are removed on rollback once empty. `finish` installs each
+/// staged file only if it hashes to the manifest the marker carries, and
+/// takes one marker at most.
+fn recovery(dest: &Path, finish: bool) -> Result<(Dir, Vec<Op>, Option<Finishing>)> {
     let root = Dir::open(dest)?;
     let left = leftovers(&root)?;
     let stuck: Vec<String> = left
@@ -1407,6 +1534,7 @@ fn recovery(dest: &Path, finish: bool) -> Result<(Dir, Vec<Op>)> {
     let has = |dir: &str, name: &str| left.iter().any(|l| l.dir == dir && l.name == name);
     let mut ops = Vec::new();
     let mut tags = Vec::new();
+    let mut finishing = None;
     for l in &left {
         let Some(tag) = l.marker_tag() else {
             continue;
@@ -1423,18 +1551,42 @@ fn recovery(dest: &Path, finish: bool) -> Result<(Dir, Vec<Op>)> {
                 }
             );
         }
+        if finish {
+            if finishing.is_some() {
+                bail!(
+                    "{} holds more than one interrupted restore; only rollback applies",
+                    dest.display()
+                );
+            }
+            let Some(manifest) = m.manifest.clone() else {
+                bail!(
+                    "{} records no manifest to check the staged files against; only rollback applies",
+                    l.name
+                );
+            };
+            manifest.validate(&l.name)?;
+            finishing = Some(Finishing {
+                manifest,
+                created: m.created_dirs.clone(),
+                owners: m.owners,
+            });
+        }
         for f in &m.files {
             check_rel(&f.path)?;
             let (dir, name) = split_rel(&f.path);
             let tmp = format!(".{name}{TEMP_MARK}{tag}");
             let prev = format!(".{name}{PREV_MARK}{tag}");
             let (tmp_left, prev_left) = (has(dir, &tmp), has(dir, &prev));
-            if finish {
+            if let Some(fin) = &finishing {
                 if tmp_left {
+                    let Some(want) = fin.manifest.files.iter().find(|e| e.path == f.path) else {
+                        bail!("{} lists {} but its manifest does not", l.name, f.path);
+                    };
                     ops.push(Op::Rename {
                         dir: dir.to_string(),
                         from: tmp,
                         to: name.to_string(),
+                        sha256: Some(want.sha256.clone()),
                     });
                 }
                 if prev_left {
@@ -1462,6 +1614,7 @@ fn recovery(dest: &Path, finish: bool) -> Result<(Dir, Vec<Op>)> {
                         dir: dir.to_string(),
                         from: prev,
                         to: name.to_string(),
+                        sha256: None,
                     });
                 }
             } else if !f.had_prev {
@@ -1498,12 +1651,25 @@ fn recovery(dest: &Path, finish: bool) -> Result<(Dir, Vec<Op>)> {
             ops.push(unlink(&l.dir, l.name.clone()));
         }
     }
-    Ok((root, ops))
+    Ok((root, ops, finishing))
 }
 
-/// Apply [`recovery`] and fsync what it touched.
-fn recover(dest: &Path, finish: bool) -> Result<Vec<String>> {
-    let (root, ops) = recovery(dest, finish)?;
+#[derive(Debug)]
+struct Recovered {
+    steps: Vec<String>,
+    /// Of the finished restore; `None` after a rollback.
+    verification: Option<Verification>,
+}
+
+/// Apply [`recovery`] and fsync what it touched. A `finish` then re-applies
+/// directory modes and verifies the restored config as a restore does.
+fn recover(dest: &Path, finish: bool) -> Result<Recovered> {
+    let (root, ops, finishing) = recovery(dest, finish)?;
+    // Every staged file is checked before anything changes, so a mismatch
+    // leaves the restore as it was and rollback still has every original.
+    for op in &ops {
+        op.check(&root)?;
+    }
     let mut done = Vec::with_capacity(ops.len());
     for op in &ops {
         op.apply(&root)
@@ -1511,6 +1677,10 @@ fn recover(dest: &Path, finish: bool) -> Result<Vec<String>> {
         done.push(op.describe());
     }
     let mut dirs: Vec<&str> = ops.iter().map(Op::dir).collect();
+    if let Some(f) = &finishing {
+        apply_dir_meta(&root, &f.manifest, &f.created, f.owners)?;
+        dirs.extend(f.manifest.dirs.iter().map(|d| d.path.as_str()));
+    }
     dirs.sort();
     dirs.dedup();
     for d in dirs {
@@ -1518,7 +1688,28 @@ fn recover(dest: &Path, finish: bool) -> Result<Vec<String>> {
             dir.0.sync_all()?;
         }
     }
-    Ok(done)
+    let verification = match finishing {
+        Some(f) => {
+            let mut v = verify(dest, &f.manifest);
+            if f.owners {
+                v.problems
+                    .extend(verify_meta(dest, &f.manifest, &f.created));
+            }
+            if !v.ok() {
+                bail!(
+                    "finished ([{}]), but the restored config failed verification: {}",
+                    done.join(", "),
+                    v.problems.join("; ")
+                );
+            }
+            Some(v)
+        }
+        None => None,
+    };
+    Ok(Recovered {
+        steps: done,
+        verification,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1654,7 +1845,7 @@ impl PbsConfigKind {
 
     fn backup_into(&self, payload_dir: &Path, instance: &str) -> Result<BackupOutcome> {
         let source = self.config_dir(instance);
-        let manifest = capture(&source, payload_dir, instance)?;
+        let (manifest, raw) = capture(&source, payload_dir, instance)?;
         let v = verify(&payload_dir.join(FILES_DIR), &manifest);
         if !v.ok() {
             bail!(
@@ -1663,7 +1854,6 @@ impl PbsConfigKind {
             );
         }
         let warning = lock_down(payload_dir)?;
-        let raw = fs::read(payload_dir.join(MANIFEST))?;
         let mut note = format!("{} files from {}", manifest.files.len(), source.display());
         if !v.orphan_tokens.is_empty() {
             note.push_str(&format!(
@@ -1675,8 +1865,6 @@ impl PbsConfigKind {
             note.push_str("; ");
             note.push_str(&w);
         }
-        // Core verification of this slot checksum is orca#478; restore
-        // re-checks every file against the manifest either way.
         Ok(BackupOutcome {
             checksum: Some(format!("sha256:{}", sha256_hex(&raw))),
             note: Some(note),
@@ -1748,7 +1936,7 @@ impl BackupKindPlugin for PbsConfigKind {
             instance,
             datastores = ?v.datastores,
             tokens = ?v.tokens,
-            "[pbs-config] restored {} files; start the container",
+            "[pbs-config] restored {} files; start the container ({CHECKSUM_SCOPE})",
             v.files_checked
         );
         Ok(())
@@ -1879,6 +2067,8 @@ pub struct ConfigRestoreOutput {
     /// Why execute would refuse.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<String>,
+    /// What the backup checksum this restore checked does and does not prove.
+    pub integrity: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<ExecutionPlan>,
 }
@@ -1966,6 +2156,7 @@ fn config_restore(
             dest: args.dest.clone(),
             verification: captured,
             blockers,
+            integrity: CHECKSUM_SCOPE.to_string(),
             plan: Some(plan),
         });
     }
@@ -1991,6 +2182,7 @@ fn config_restore(
         dest: args.dest.clone(),
         verification: restored,
         blockers: Vec::new(),
+        integrity: CHECKSUM_SCOPE.to_string(),
         plan: None,
     })
 }
@@ -2021,6 +2213,9 @@ pub struct ConfigRecoverOutput {
     pub dry_run: bool,
     /// Planned on a dry run; applied on execute.
     pub steps: Vec<String>,
+    /// The finished config's verification, as a restore reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<Verification>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<ExecutionPlan>,
 }
@@ -2067,14 +2262,17 @@ fn config_recover(
         return Ok(ConfigRecoverOutput {
             dry_run: true,
             steps,
+            verification: None,
             plan: Some(plan),
         });
     }
     plan::authorize_execute(TOOL, caller)?;
     kind.ensure_stopped(&args.instance)?;
+    let done = recover(&live, finish)?;
     Ok(ConfigRecoverOutput {
         dry_run: false,
-        steps: recover(&live, finish)?,
+        steps: done.steps,
+        verification: done.verification,
         plan: None,
     })
 }
@@ -2227,7 +2425,7 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         seed(src.path());
-        let m = capture(src.path(), out.path(), "pbs").unwrap();
+        let (m, _) = capture(src.path(), out.path(), "pbs").unwrap();
         assert_eq!(m.files.len(), collect(src.path()).unwrap().len());
 
         let key = m.files.iter().find(|f| f.path == "authkey.key").unwrap();
@@ -2362,7 +2560,7 @@ mod tests {
             changes.set(changes.get() + 1);
         };
         let out = tempfile::tempdir().unwrap();
-        let m = capture_with(src.path(), out.path(), "pbs", &once).unwrap();
+        let (m, _) = capture_with(src.path(), out.path(), "pbs", &once).unwrap();
         let entry = m.files.iter().find(|f| f.path == "user.cfg").unwrap();
         assert_eq!(
             entry.sha256,
@@ -2403,7 +2601,7 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         seed(src.path());
-        let m = capture(src.path(), out.path(), "pbs").unwrap();
+        let (m, _) = capture(src.path(), out.path(), "pbs").unwrap();
         let v = verify(&out.path().join(FILES_DIR), &m);
         assert!(v.ok(), "{:?}", v.problems);
         assert_eq!(v.files_checked, m.files.len());
@@ -2417,7 +2615,7 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         seed(src.path());
-        let m = capture(src.path(), out.path(), "pbs").unwrap();
+        let (m, _) = capture(src.path(), out.path(), "pbs").unwrap();
         let files = out.path().join(FILES_DIR);
         fs::write(files.join("acl.cfg"), "changed\n").unwrap();
         fs::remove_file(files.join("proxy.key")).unwrap();
@@ -2614,7 +2812,7 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let payload = tempfile::tempdir().unwrap();
         seed(src.path());
-        let m = capture(src.path(), payload.path(), "pbs").unwrap();
+        let (m, _) = capture(src.path(), payload.path(), "pbs").unwrap();
         for f in &m.files {
             fs::write(src.path().join(&f.path), "live\n").unwrap();
         }
@@ -2740,9 +2938,127 @@ mod tests {
     fn an_interrupted_restore_can_be_finished() {
         let (live, payload, m) = drifted();
         crash_mid_swap(live.path(), payload.path(), &m);
-        recover(live.path(), true).unwrap();
+        fs::set_permissions(live.path().join("acme"), fs::Permissions::from_mode(0o700)).unwrap();
+        let v = recover(live.path(), true).unwrap().verification.unwrap();
+        assert!(v.ok(), "{:?}", v.problems);
+        assert_eq!(v.files_checked, m.files.len());
         assert_all(live.path(), &m, captured_text(payload.path()));
+        assert_eq!(mode(&live.path().join("acme")), 0o750);
         assert!(all_leftovers(live.path()).is_empty());
+    }
+
+    #[test]
+    fn finish_refuses_a_staged_file_that_no_longer_matches_the_manifest() {
+        let (live, payload, m) = drifted();
+        crash_mid_swap(live.path(), payload.path(), &m);
+        let staged = live.path().join(".authkey.key.orca-restore-T");
+        fs::write(&staged, "planted\n").unwrap();
+        let err = format!("{:#}", recover(live.path(), true).unwrap_err());
+        assert!(err.contains("does not match the backup manifest"), "{err}");
+        assert_eq!(
+            fs::read_to_string(live.path().join("authkey.key")).unwrap(),
+            "live\n"
+        );
+        recover(live.path(), false).unwrap();
+        assert_all(live.path(), &m, |_| "live\n".to_string());
+        assert!(all_leftovers(live.path()).is_empty());
+    }
+
+    #[test]
+    fn an_unrecorded_rollback_puts_nothing_back_and_can_still_finish() {
+        let (live, payload, m) = drifted();
+        let l = live.path();
+        let calls = std::cell::Cell::new(0);
+        // The third rename fails, and a stray `.next` makes the rollback's
+        // marker write fail too.
+        let flaky = |d: &Dir, a: &str, b: &str| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                fs::write(l.join(format!("{SWAP_MARK}T{NEXT_SUFFIX}")), "").unwrap();
+                return Err(io::Error::other("disk full"));
+            }
+            d.rename(a, b)
+        };
+        let err = materialize_with(payload.path(), l, &m, true, "T", &flaky).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("nothing was put back"),
+            "{err:#}"
+        );
+        let want = captured_text(payload.path());
+        for (i, f) in m.files.iter().enumerate() {
+            let got = fs::read_to_string(l.join(&f.path)).unwrap();
+            if i < 2 {
+                assert_eq!(got, want(f), "{}", f.path);
+            } else {
+                assert_eq!(got, "live\n", "{}", f.path);
+            }
+        }
+        let marker: SwapMarker =
+            serde_json::from_slice(&fs::read(l.join(format!("{SWAP_MARK}T"))).unwrap()).unwrap();
+        assert_eq!(marker.phase, Phase::Swapping);
+
+        let v = recover(l, true).unwrap().verification.unwrap();
+        assert!(v.ok(), "{:?}", v.problems);
+        assert_all(l, &m, want);
+        assert!(verify_meta(l, &m, &[]).is_empty());
+        assert!(all_leftovers(l).is_empty(), "{:?}", all_leftovers(l));
+    }
+
+    #[test]
+    fn a_failed_marker_write_removes_its_next_file() {
+        let (live, _payload, m) = drifted();
+        let l = live.path();
+        let target = l.join(format!("{SWAP_MARK}T"));
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("x"), "").unwrap();
+        let mut w = Work {
+            root: Dir::open(l).unwrap(),
+            tag: "T",
+            manifest: &m,
+            owners: false,
+            phase: Phase::Staging,
+            created: Vec::new(),
+            staged: Vec::new(),
+            marker: None,
+            failures: Vec::new(),
+            stranded: false,
+        };
+        assert!(w.write_marker().is_err());
+        assert!(!l.join(format!("{SWAP_MARK}T{NEXT_SUFFIX}")).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn names_that_are_not_utf8_are_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let (live, _payload, _m) = drifted();
+        let odd = std::ffi::OsStr::from_bytes(b"bad\xffname");
+        fs::write(live.path().join(odd), "x").unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let err = format!("{:#}", capture(live.path(), out.path(), "pbs").unwrap_err());
+        assert!(err.contains("not a valid UTF-8 name"), "{err}");
+        let err = format!(
+            "{:#}",
+            leftovers(&Dir::open(live.path()).unwrap()).unwrap_err()
+        );
+        assert!(err.contains("not a valid UTF-8 name"), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_nodes_and_fifos_are_refused_without_being_opened() {
+        let src = tempfile::tempdir().unwrap();
+        let pipe = CString::new(src.path().join("pipe").to_str().unwrap()).unwrap();
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
+        let root = Dir::open(src.path()).unwrap();
+        // A FIFO opened for reading would block; the O_PATH lookup never opens it.
+        let err = root.file("pipe").unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        fs::write(src.path().join("f"), "x").unwrap();
+        let mut buf = String::new();
+        root.file("f").unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "x");
     }
 
     #[test]
@@ -2750,7 +3066,7 @@ mod tests {
         let (live, _payload, m) = drifted();
         fs::write(live.path().join(".user.cfg.orca-restore-X"), "partial").unwrap();
         fs::write(live.path().join("acme/.accounts.orca-prev-X"), "old").unwrap();
-        let steps = recover(live.path(), true).unwrap();
+        let steps = recover(live.path(), true).unwrap().steps;
         assert_eq!(steps.len(), 2, "{steps:?}");
         assert!(all_leftovers(live.path()).is_empty());
         assert_all(live.path(), &m, |_| "live\n".to_string());
@@ -2833,7 +3149,7 @@ mod tests {
             "files": [{"path": "user.cfg", "hadPrev": true}], "createdDirs": []});
         fs::write(l.join(".orca-swap-I"), marker.to_string()).unwrap();
         fs::hard_link(l.join("user.cfg"), l.join(".user.cfg.orca-prev-I")).unwrap();
-        let (_, ops) = recovery(l, false).unwrap();
+        let (_, ops, _) = recovery(l, false).unwrap();
         assert!(
             ops.contains(&unlink("", ".user.cfg.orca-prev-I")),
             "{ops:?}"
@@ -2851,7 +3167,7 @@ mod tests {
     fn markers_count_only_at_the_config_root() {
         let (live, _payload, _m) = drifted();
         fs::write(live.path().join("acme/.orca-swap-X"), "not a marker").unwrap();
-        let (_, ops) = recovery(live.path(), true).unwrap();
+        let (_, ops, _) = recovery(live.path(), true).unwrap();
         assert_eq!(ops, [unlink("acme", ".orca-swap-X")]);
         recover(live.path(), true).unwrap();
         assert!(all_leftovers(live.path()).is_empty());
@@ -2936,7 +3252,7 @@ mod tests {
         );
         assert!(root.file("pipe").is_err());
         let out = tempfile::tempdir().unwrap();
-        let m = capture(src.path(), out.path(), "pbs").unwrap();
+        let (m, _) = capture(src.path(), out.path(), "pbs").unwrap();
         assert!(!m.files.iter().any(|f| f.path == "pipe"));
     }
 
@@ -2949,8 +3265,7 @@ mod tests {
         fs::create_dir_all(&payload).unwrap();
         let src = tempfile::tempdir().unwrap();
         seed(src.path());
-        capture(src.path(), &payload, "pbs").unwrap();
-        let raw = fs::read(payload.join(MANIFEST)).unwrap();
+        let (_, raw) = capture(src.path(), &payload, "pbs").unwrap();
         commit(&payload, Some(&format!("sha256:{}", sha256_hex(&raw))));
         (store, payload)
     }
@@ -2972,6 +3287,7 @@ mod tests {
         assert!(out.dry_run);
         assert!(out.verification.ok());
         assert!(out.blockers.is_empty(), "{:?}", out.blockers);
+        assert!(out.integrity.contains("not tampering"), "{}", out.integrity);
         assert_eq!(out.verification.datastores, ["willow-primary", "offsite"]);
         let plan = out.plan.unwrap();
         assert!(plan.changes.iter().any(|c| c.target == "token.shadow"));
