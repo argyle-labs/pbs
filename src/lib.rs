@@ -99,6 +99,25 @@ pub const RESTORE_CRITICAL: &[&str] = &[
     "proxy.pem",
 ];
 
+/// `^[A-Za-z0-9][A-Za-z0-9_-]{0,max-1}$`: safe as a path component, a
+/// volume name and a PBS user name.
+pub(crate) fn plain_name(s: &str, max: usize) -> bool {
+    let mut chars = s.chars();
+    (1..=max).contains(&s.len())
+        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Instance names become a volume name and a path under the volume root.
+pub fn validate_instance(instance: &str) -> plugin_toolkit::prelude::Result<()> {
+    if !plain_name(instance, 64) {
+        plugin_toolkit::prelude::bail!(
+            "invalid instance {instance:?}: must match ^[A-Za-z0-9][A-Za-z0-9_-]{{0,63}}$"
+        );
+    }
+    Ok(())
+}
+
 /// Named volume holding [`CONFIG_DIR`]. For the instance `pbs` this is
 /// `pbs-config`, the volume the live container and the README's `docker run`
 /// use, so a redeploy reattaches the existing config instead of starting empty.
