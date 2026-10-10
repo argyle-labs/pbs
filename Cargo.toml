@@ -19,7 +19,7 @@ path = "src/main.rs"
 # Registers a ServiceBackend and the `pbs.` tool surface over the orca socket,
 # reaching orca through plugin-toolkit alone.
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.2.1-rc.14" }
 # Outside the toolkit: a custom certificate verifier that pins
 # PBS's self-signed cert by fingerprint, handed to reqwest as a preconfigured
 # rustls config. Same version reqwest already links.
@@ -29,7 +29,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 libc = "0.2"
 
 [dev-dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.2.1-rc.14" }
 tokio    = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 tempfile = "3"
 
