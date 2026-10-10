@@ -177,6 +177,7 @@ pub fn namespace_create_steps(store: &str, existing: &[Namespace], ns: &str) -> 
     execute_gated = false
 )]
 pub async fn pbs_namespace_create(args: NamespaceCreateArgs, ctx: &ToolCtx) -> Result<Change> {
+    crate::plan::require_admin("pbs.namespace.create", ctx.caller().as_ref())?;
     const TOOL: &str = "pbs.namespace.create";
     api::validate_ns(&args.ns)?;
     let c = endpoint::connect(args.endpoint.as_deref()).await?;
@@ -230,6 +231,7 @@ pub struct NamespaceDeleteArgs {
     execute_gated = false
 )]
 pub async fn pbs_namespace_delete(args: NamespaceDeleteArgs, ctx: &ToolCtx) -> Result<Change> {
+    crate::plan::require_admin("pbs.namespace.delete", ctx.caller().as_ref())?;
     api::validate_ns(&args.ns)?;
     let c = endpoint::connect(args.endpoint.as_deref()).await?;
     namespace_delete(&c, &args, ctx.caller().as_ref()).await
@@ -250,7 +252,7 @@ async fn namespace_delete(
     let (steps, notes) =
         namespace_delete_steps(&args.datastore, &existing, &args.ns, contents.as_ref());
     if args.execute {
-        plan::authorize_execute(TOOL, caller)?;
+        plan::require_admin(TOOL, caller)?;
         plan::refuse_drifted(TOOL, &steps, &args.items)?;
     }
     let summary = format!(
@@ -568,7 +570,10 @@ mod tests {
             delete_groups: true,
             ..Default::default()
         };
-        let Change::Plan(p) = namespace_delete(&m.client(), &args, None).await.unwrap() else {
+        let Change::Plan(p) = namespace_delete(&m.client(), &args, Some(&crate::plan::admin()))
+            .await
+            .unwrap()
+        else {
             panic!()
         };
         args.items = p.changes.iter().map(|c| c.target.clone()).collect();

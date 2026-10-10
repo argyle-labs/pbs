@@ -2394,6 +2394,7 @@ pub async fn pbs_config_restore(
     args: ConfigRestoreArgs,
     ctx: &ToolCtx,
 ) -> Result<ConfigRestoreOutput> {
+    crate::plan::require_admin("pbs.config_restore", ctx.caller().as_ref())?;
     config_restore(&args, ctx.caller().as_ref())
 }
 
@@ -2439,7 +2440,7 @@ fn config_restore(
             plan: Some(plan),
         });
     }
-    plan::authorize_execute(TOOL, caller)?;
+    plan::require_admin(TOOL, caller)?;
     if !blockers.is_empty() {
         bail!("{TOOL}: refusing: {}", blockers.join("; "));
     }
@@ -2520,6 +2521,7 @@ pub async fn pbs_config_recover(
     args: ConfigRecoverArgs,
     ctx: &ToolCtx,
 ) -> Result<ConfigRecoverOutput> {
+    crate::plan::require_admin("pbs.config_recover", ctx.caller().as_ref())?;
     config_recover(&PbsConfigKind::from_env(), &args, ctx.caller().as_ref())
 }
 
@@ -2561,7 +2563,7 @@ fn config_recover(
             plan: Some(plan),
         });
     }
-    plan::authorize_execute(TOOL, caller)?;
+    plan::require_admin(TOOL, caller)?;
     kind.ensure_stopped(&args.instance)?;
     let done = recover(&live, &args.instance, kind.data_root(), finish, payload)?;
     Ok(ConfigRecoverOutput {
