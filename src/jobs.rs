@@ -483,6 +483,7 @@ pub struct SyncJobCreateArgs {
     execute_gated = false
 )]
 pub async fn pbs_sync_job_create(args: SyncJobCreateArgs, ctx: &ToolCtx) -> Result<Change> {
+    crate::plan::require_admin("pbs.sync_job.create", ctx.caller().as_ref())?;
     if args.fields.store.is_none() || args.fields.remote_store.is_none() {
         bail!("pbs.sync_job.create needs store and remote_store");
     }
@@ -529,6 +530,7 @@ pub struct SyncJobUpdateArgs {
     execute_gated = false
 )]
 pub async fn pbs_sync_job_update(args: SyncJobUpdateArgs, ctx: &ToolCtx) -> Result<Change> {
+    crate::plan::require_admin("pbs.sync_job.update", ctx.caller().as_ref())?;
     let fields = args.fields.to_map();
     mutate(
         "pbs.sync_job.update",
@@ -565,6 +567,7 @@ pub struct JobRunArgs {
     execute_gated = false
 )]
 pub async fn pbs_sync_job_run(args: JobRunArgs, ctx: &ToolCtx) -> Result<Change> {
+    crate::plan::require_admin("pbs.sync_job.run", ctx.caller().as_ref())?;
     mutate(
         "pbs.sync_job.run",
         Kind::Sync,
@@ -669,6 +672,7 @@ pub struct VerifyJobCreateArgs {
     execute_gated = false
 )]
 pub async fn pbs_verify_job_create(args: VerifyJobCreateArgs, ctx: &ToolCtx) -> Result<Change> {
+    crate::plan::require_admin("pbs.verify_job.create", ctx.caller().as_ref())?;
     if args.fields.store.is_none() {
         bail!("pbs.verify_job.create needs store");
     }
@@ -715,6 +719,7 @@ pub struct VerifyJobUpdateArgs {
     execute_gated = false
 )]
 pub async fn pbs_verify_job_update(args: VerifyJobUpdateArgs, ctx: &ToolCtx) -> Result<Change> {
+    crate::plan::require_admin("pbs.verify_job.update", ctx.caller().as_ref())?;
     let fields = args.fields.to_map();
     mutate(
         "pbs.verify_job.update",
@@ -738,6 +743,7 @@ pub async fn pbs_verify_job_update(args: VerifyJobUpdateArgs, ctx: &ToolCtx) -> 
     execute_gated = false
 )]
 pub async fn pbs_verify_job_run(args: JobRunArgs, ctx: &ToolCtx) -> Result<Change> {
+    crate::plan::require_admin("pbs.verify_job.run", ctx.caller().as_ref())?;
     mutate(
         "pbs.verify_job.run",
         Kind::Verify,
@@ -887,7 +893,7 @@ mod tests {
             &json!({}),
             "willow-to-maple",
             false,
-            None,
+            Some(&crate::plan::admin()),
             true,
             |e, d| update_steps(Kind::Sync, e, "willow-to-maple", fields, &[], d),
         )

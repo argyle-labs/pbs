@@ -270,6 +270,7 @@ pub fn group_delete_steps(
     execute_gated = false
 )]
 pub async fn pbs_group_delete(args: GroupDeleteArgs, ctx: &ToolCtx) -> Result<Change> {
+    crate::plan::require_admin("pbs.group.delete", ctx.caller().as_ref())?;
     let c = endpoint::connect(args.endpoint.as_deref()).await?;
     group_delete(&c, &args, ctx.caller().as_ref()).await
 }
@@ -293,7 +294,7 @@ async fn group_delete(
         args.all_datastores,
     );
     if args.execute {
-        plan::authorize_execute(TOOL, caller)?;
+        plan::require_admin(TOOL, caller)?;
         plan::refuse_drifted(TOOL, &steps, &args.items)?;
     }
     let summary = format!("delete group {}/{}", args.backup_type, args.backup_id);
@@ -551,6 +552,7 @@ pub fn prune_steps(
 /// reclaimed by the next GC. Dry-run by default.
 #[orca_tool(domain = "pbs", verb = "prune", role = "admin", execute_gated = false)]
 pub async fn pbs_prune(args: PruneArgs, ctx: &ToolCtx) -> Result<Change> {
+    crate::plan::require_admin("pbs.prune", ctx.caller().as_ref())?;
     let c = endpoint::connect(args.endpoint.as_deref()).await?;
     prune(&c, &args, ctx.caller().as_ref()).await
 }
@@ -701,6 +703,7 @@ pub struct GcRunArgs {
 /// Start garbage collection on a datastore. Returns the task UPID on execute.
 #[orca_tool(domain = "pbs", verb = "gc.run", role = "admin", execute_gated = false)]
 pub async fn pbs_gc_run(args: GcRunArgs, ctx: &ToolCtx) -> Result<Change> {
+    crate::plan::require_admin("pbs.gc.run", ctx.caller().as_ref())?;
     const TOOL: &str = "pbs.gc.run";
     let c = endpoint::connect(args.endpoint.as_deref()).await?;
     let status = api::gc_status(&c, &args.datastore).await?;
@@ -914,7 +917,9 @@ mod tests {
             datastore: "main".into(),
             ..Default::default()
         };
-        let err = prune(&m.client(), &base, None).await.unwrap_err();
+        let err = prune(&m.client(), &base, Some(&crate::plan::admin()))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("all_groups"), "{err}");
         let both = PruneArgs {
             backup_type: Some("vm".into()),
@@ -922,13 +927,18 @@ mod tests {
             datastore: "main".into(),
             ..Default::default()
         };
-        assert!(prune(&m.client(), &both, None).await.is_err());
+        assert!(prune(&m.client(), &both, Some(&crate::plan::admin()))
+            .await
+            .is_err());
         assert!(m.log().is_empty());
         let all = PruneArgs {
             all_groups: true,
             ..base
         };
-        let Change::Plan(p) = prune(&m.client(), &all, None).await.unwrap() else {
+        let Change::Plan(p) = prune(&m.client(), &all, Some(&crate::plan::admin()))
+            .await
+            .unwrap()
+        else {
             panic!()
         };
         assert_eq!(p.changes.len(), 3, "every group previewed as prunable");
@@ -942,7 +952,9 @@ mod tests {
             backup_type: Some("vm".into()),
             ..Default::default()
         };
-        let out = prune(&m.client(), &args, None).await.unwrap();
+        let out = prune(&m.client(), &args, Some(&crate::plan::admin()))
+            .await
+            .unwrap();
         let Change::Plan(p) = out else {
             panic!("expected plan")
         };
@@ -1022,7 +1034,10 @@ mod tests {
             backup_id: "111".into(),
             ..Default::default()
         };
-        let Change::Plan(p) = group_delete(&m.client(), &args, None).await.unwrap() else {
+        let Change::Plan(p) = group_delete(&m.client(), &args, Some(&crate::plan::admin()))
+            .await
+            .unwrap()
+        else {
             panic!("expected plan")
         };
         let mut grown: Value = serde_json::from_str(GROUPS_LIST).unwrap();

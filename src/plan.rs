@@ -5,7 +5,8 @@
 //! order. Mutating verbs set `execute_gated = false` and own `execute`, because
 //! the central gate can only return a generic plan while these verbs can name
 //! each API call. Opting out of the central gate also opts out of the role
-//! check it runs, so [`authorize_execute`] replaces it.
+//! check it runs, so [`require_admin`] replaces it, and runs before the dry run
+//! too: an admin verb's plan reveals what an admin could change.
 
 use plugin_toolkit::contract::plan::{ExecutionPlan, PlannedChange};
 use plugin_toolkit::contract::CallerIdentity;
@@ -124,17 +125,17 @@ pub enum Change {
     Applied(Applied),
 }
 
-/// Fail closed: applying changes needs an identified admin caller.
-pub fn authorize_execute(tool: &str, caller: Option<&CallerIdentity>) -> Result<()> {
+/// Fail closed: an admin verb, dry run included, needs an identified admin caller.
+pub fn require_admin(tool: &str, caller: Option<&CallerIdentity>) -> Result<()> {
     match caller {
         Some(c) if c.role == "admin" => Ok(()),
         Some(c) => bail!(
-            "{tool}: execute requires role 'admin'; caller '{}' has '{}'",
+            "{tool}: requires role 'admin' (dry run included); caller '{}' has '{}'",
             c.username,
             c.role
         ),
         None => bail!(
-            "{tool}: execute refused: the call carries no caller identity, so admin cannot be verified"
+            "{tool}: refused: the call carries no caller identity, so admin cannot be verified"
         ),
     }
 }
@@ -296,10 +297,10 @@ pub async fn plan_or_apply<A: Serialize>(
     mut notes: Vec<String>,
     confirmed: Option<&[String]>,
 ) -> Result<Change> {
+    require_admin(tool, caller)?;
     if !execute {
         return Ok(Change::Plan(plan(tool, args, summary, &steps, &notes)?));
     }
-    authorize_execute(tool, caller)?;
     let steps = match confirmed {
         Some(items) => {
             let (kept, dropped) = confirm(tool, steps, items)?;
@@ -360,14 +361,14 @@ mod tests {
 
     #[test]
     fn execute_needs_an_admin_identity() {
-        assert!(authorize_execute("t", None).is_err());
+        assert!(require_admin("t", None).is_err());
         let mut c = admin();
         c.role = "read".into();
-        assert!(authorize_execute("t", Some(&c))
+        assert!(require_admin("t", Some(&c))
             .unwrap_err()
             .to_string()
             .contains("role 'admin'"));
-        assert!(authorize_execute("t", Some(&admin())).is_ok());
+        assert!(require_admin("t", Some(&admin())).is_ok());
     }
 
     #[tokio::test]
@@ -377,7 +378,7 @@ mod tests {
             "pbs.t",
             &json!({}),
             false,
-            None,
+            Some(&admin()),
             &m.client(),
             "s".into(),
             steps(),
@@ -511,5 +512,62 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("needs the items"), "{err}");
         assert!(m.log().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod admin_gate_tests {
+    use plugin_toolkit::contract::CallerIdentity;
+
+    fn user() -> CallerIdentity {
+        CallerIdentity {
+            user_id: "2".into(),
+            username: "op".into(),
+            role: "user".into(),
+            can_mutate: true,
+        }
+    }
+
+    /// Every admin verb refuses a dry run from a non-admin, and from a call with
+    /// no caller identity, before it reads anything.
+    #[tokio::test]
+    async fn every_admin_verb_refuses_a_non_admin_dry_run() {
+        macro_rules! refused {
+            ($f:path, $verb:literal) => {
+                for ctx in [
+                    crate::endpoint::test_store::ctx(),
+                    crate::endpoint::test_store::ctx().with_auth(user()),
+                ] {
+                    let err = $f(Default::default(), &ctx).await.err().expect($verb);
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains($verb) && msg.contains("admin"),
+                        "{}: {msg}",
+                        $verb
+                    );
+                }
+            };
+        }
+        refused!(crate::groups::pbs_group_delete, "pbs.group.delete");
+        refused!(crate::groups::pbs_prune, "pbs.prune");
+        refused!(crate::groups::pbs_gc_run, "pbs.gc.run");
+        refused!(crate::tools::pbs_namespace_create, "pbs.namespace.create");
+        refused!(crate::tools::pbs_namespace_delete, "pbs.namespace.delete");
+        refused!(crate::jobs::pbs_sync_job_create, "pbs.sync_job.create");
+        refused!(crate::jobs::pbs_sync_job_update, "pbs.sync_job.update");
+        refused!(crate::jobs::pbs_sync_job_run, "pbs.sync_job.run");
+        refused!(crate::jobs::pbs_verify_job_create, "pbs.verify_job.create");
+        refused!(crate::jobs::pbs_verify_job_update, "pbs.verify_job.update");
+        refused!(crate::jobs::pbs_verify_job_run, "pbs.verify_job.run");
+        refused!(crate::enroll::pbs_host_enroll, "pbs.host.enroll");
+        refused!(crate::enroll::pbs_host_revoke, "pbs.host.revoke");
+        refused!(
+            crate::config_backup::pbs_config_restore,
+            "pbs.config_restore"
+        );
+        refused!(
+            crate::config_backup::pbs_config_recover,
+            "pbs.config_recover"
+        );
     }
 }

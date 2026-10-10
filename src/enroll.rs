@@ -590,6 +590,7 @@ pub struct HostEnrollOutput {
     execute_gated = false
 )]
 pub async fn pbs_host_enroll(args: HostEnrollArgs, ctx: &ToolCtx) -> Result<HostEnrollOutput> {
+    crate::plan::require_admin("pbs.host.enroll", ctx.caller().as_ref())?;
     let id = Identity::new(&args.host, &args.datastore)?;
     let (ep, c) = endpoint::connect_named(args.endpoint.as_deref()).await?;
     enroll(&ep, &c, &id, &args, ctx.caller().as_ref()).await
@@ -624,7 +625,7 @@ async fn enroll(
     if !args.execute {
         return Ok(out);
     }
-    plan::authorize_execute(TOOL, caller)?;
+    plan::require_admin(TOOL, caller)?;
     let (mut steps, notes) = plan::confirm(TOOL, steps, &args.items)?;
     stamp_acl_digest(&mut steps, st.acl_digest.as_deref());
     let desc = format!("PBS token {} (pbs endpoint '{ep}')", id.tokenid);
@@ -705,6 +706,7 @@ pub struct HostRevokeOutput {
     execute_gated = false
 )]
 pub async fn pbs_host_revoke(args: HostRevokeArgs, ctx: &ToolCtx) -> Result<HostRevokeOutput> {
+    crate::plan::require_admin("pbs.host.revoke", ctx.caller().as_ref())?;
     let id = Identity::new(&args.host, &args.datastore)?;
     let (ep, c) = endpoint::connect_named(args.endpoint.as_deref()).await?;
     revoke(&ep, &c, &id, &args, ctx.caller().as_ref()).await
@@ -754,7 +756,7 @@ async fn revoke(
             secret_removed: false,
         });
     }
-    plan::authorize_execute(TOOL, caller)?;
+    plan::require_admin(TOOL, caller)?;
     plan::refuse_drifted(TOOL, &steps, &args.items)?;
     let (mut steps, dropped) = plan::confirm(TOOL, steps, &args.items)?;
     stamp_acl_digest(&mut steps, st.acl_digest.as_deref());
