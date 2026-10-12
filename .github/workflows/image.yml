@@ -41,6 +41,9 @@ env:
 jobs:
   image:
     runs-on: ubuntu-latest
+    env:
+      # Step `if:` can't read `secrets`; job env can.
+      HAS_GH_TOKEN: ${{ secrets.GH_TOKEN != '' }}
     permissions:
       contents: read
       packages: write
@@ -50,7 +53,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to ghcr.io
-        if: ${{ env.PUSH == 'true' && secrets.GH_TOKEN != '' }}
+        if: ${{ env.PUSH == 'true' && env.HAS_GH_TOKEN == 'true' }}
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -69,7 +72,7 @@ jobs:
         id: tags
         run: |
           TAGS=""
-          if [ -n "${{ secrets.GH_TOKEN }}" ]; then
+          if [ "$HAS_GH_TOKEN" = true ]; then
             TAGS="ghcr.io/${IMAGE_NAME}:${TAG}"
           fi
           if [ -n "${{ vars.CI_REGISTRY }}" ]; then
@@ -140,7 +143,7 @@ jobs:
           docker push "$REF"
 
       - name: Push to ghcr.io
-        if: ${{ env.PUSH == 'true' && secrets.GH_TOKEN != '' }}
+        if: ${{ env.PUSH == 'true' && env.HAS_GH_TOKEN == 'true' }}
         run: |
           REF="ghcr.io/${IMAGE_NAME}:${TAG}"
           docker tag pbs:ci "$REF"
