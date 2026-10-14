@@ -89,6 +89,140 @@ async fn datastore_detail(c: &PbsClient, store: &str) -> Result<DatastoreDetailO
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// pbs.datastore.health
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn default_min_free_pct() -> u8 {
+    10
+}
+
+#[orca_struct(args)]
+#[serde(rename_all = "camelCase")]
+pub struct DatastoreHealthArgs {
+    #[arg(long)]
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Free space below this percent of total is a problem.
+    #[arg(long, default_value_t = 10)]
+    #[serde(default = "default_min_free_pct")]
+    pub min_free_pct: u8,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DatastoreHealth {
+    pub datastore: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avail: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gc_last_run_state: Option<String>,
+    pub ok: bool,
+    pub problems: Vec<String>,
+}
+
+#[orca_struct]
+#[serde(rename_all = "camelCase")]
+pub struct DatastoreHealthOutput {
+    pub ok: bool,
+    pub datastores: Vec<DatastoreHealth>,
+}
+
+/// Health of every datastore: whether its chunk store is reachable (a store
+/// whose backing mount vanished fails its status read), mount and maintenance
+/// state, free space, and the last GC result. Read-only.
+#[orca_tool(domain = "pbs", verb = "datastore.health", role = "read")]
+pub async fn pbs_datastore_health(
+    args: DatastoreHealthArgs,
+    _ctx: &ToolCtx,
+) -> Result<DatastoreHealthOutput> {
+    let c = endpoint::connect(args.endpoint.as_deref()).await?;
+    datastore_health(&c, args.min_free_pct).await
+}
+
+async fn datastore_health(c: &PbsClient, min_free_pct: u8) -> Result<DatastoreHealthOutput> {
+    let mut datastores = Vec::new();
+    for ds in api::datastores(c).await? {
+        let status = api::datastore_status(c, &ds.store).await;
+        let gc = match status {
+            Ok(_) => Some(api::gc_status(c, &ds.store).await),
+            Err(_) => None,
+        };
+        datastores.push(assess_datastore(ds, status, gc, min_free_pct));
+    }
+    Ok(DatastoreHealthOutput {
+        ok: datastores.iter().all(|d| d.ok),
+        datastores,
+    })
+}
+
+fn assess_datastore(
+    ds: Datastore,
+    status: Result<DatastoreStatus>,
+    gc: Option<Result<GcStatus>>,
+    min_free_pct: u8,
+) -> DatastoreHealth {
+    let mut problems = Vec::new();
+    if ds.mount_status.as_deref() == Some("notmounted") {
+        problems.push("removable datastore is not mounted".to_string());
+    }
+    if let Some(m) = &ds.maintenance {
+        problems.push(format!("in maintenance mode: {m}"));
+    }
+    let (total, avail) = match &status {
+        Ok(st) => {
+            if st.total == 0 {
+                problems.push("reports 0 bytes total: backing path empty or unmounted".into());
+            } else if (st.avail as u128) * 100 < (st.total as u128) * min_free_pct as u128 {
+                problems.push(format!(
+                    "{} of {} bytes free, under {min_free_pct}%",
+                    st.avail, st.total
+                ));
+            }
+            (Some(st.total), Some(st.avail))
+        }
+        Err(e) => {
+            problems.push(format!(
+                "status unreadable (chunk store missing or stale mount): {e:#}"
+            ));
+            (None, None)
+        }
+    };
+    let gc_last_run_state = match gc {
+        Some(Ok(gc)) => {
+            if let Some(state) = gc.last_run_state.as_deref().filter(|s| *s != "ok") {
+                problems.push(format!("last GC: {state}"));
+            }
+            if gc.still_bad > 0 {
+                problems.push(format!("GC found {} chunks still bad", gc.still_bad));
+            }
+            gc.last_run_state
+        }
+        Some(Err(e)) => {
+            problems.push(format!("GC status unreadable: {e:#}"));
+            None
+        }
+        None => None,
+    };
+    DatastoreHealth {
+        datastore: ds.store,
+        mount_status: ds.mount_status,
+        maintenance: ds.maintenance,
+        total,
+        avail,
+        gc_last_run_state,
+        ok: problems.is_empty(),
+        problems,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // pbs.namespace.{list,create,delete}
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -520,6 +654,82 @@ mod tests {
         let d = datastore_detail(&m.client(), "main").await.unwrap();
         assert_eq!(d.status.used, 1_099_511_627_776);
         assert_eq!(d.gc.next_run, Some(1_759_636_800));
+    }
+
+    #[tokio::test]
+    async fn datastore_health_flags_an_unreadable_store_and_passes_a_healthy_one() {
+        let m = MockTransport::new();
+        m.on(Method::Get, "/admin/datastore", 200, DATASTORE_LIST);
+        m.on(
+            Method::Get,
+            "/admin/datastore/main/status",
+            200,
+            DATASTORE_STATUS,
+        );
+        m.on(Method::Get, "/admin/datastore/main/gc", 200, GC_STATUS);
+        m.on(
+            Method::Get,
+            "/admin/datastore/archive/status",
+            400,
+            r#"{"data":null,"message":"unable to open chunk store at \"/mnt/pbs/.chunks\""}"#,
+        );
+        let h = datastore_health(&m.client(), 10).await.unwrap();
+        assert!(!h.ok);
+        assert!(h.datastores[0].ok, "{:?}", h.datastores[0].problems);
+        assert_eq!(h.datastores[0].gc_last_run_state.as_deref(), Some("ok"));
+        let archive = &h.datastores[1];
+        assert!(!archive.ok);
+        assert!(
+            archive.problems[0].starts_with("status unreadable"),
+            "{:?}",
+            archive.problems
+        );
+        assert!(!m.log().iter().any(|l| l.contains("archive/gc")));
+    }
+
+    fn ds(mount: Option<&str>, maintenance: Option<&str>) -> Datastore {
+        Datastore {
+            store: "main".into(),
+            comment: None,
+            backend_type: None,
+            mount_status: mount.map(str::to_string),
+            maintenance: maintenance.map(str::to_string),
+        }
+    }
+
+    fn st(total: u64, avail: u64) -> Result<DatastoreStatus> {
+        Ok(DatastoreStatus {
+            total,
+            used: total - avail,
+            avail,
+            backend_type: None,
+            counts: None,
+            gc_status: None,
+        })
+    }
+
+    #[test]
+    fn datastore_health_problems() {
+        let h = assess_datastore(
+            ds(Some("notmounted"), Some("read-only")),
+            st(0, 0),
+            None,
+            10,
+        );
+        assert_eq!(h.problems.len(), 3, "{:?}", h.problems);
+        let low = assess_datastore(ds(None, None), st(1000, 99), None, 10);
+        assert!(low.problems[0].contains("under 10%"));
+        assert!(assess_datastore(ds(None, None), st(1000, 100), None, 10).ok);
+        let gc = GcStatus {
+            last_run_state: Some("TASK ERROR: EIO".into()),
+            still_bad: 2,
+            ..GcStatus::default()
+        };
+        let h = assess_datastore(ds(None, None), st(1000, 500), Some(Ok(gc)), 10);
+        assert_eq!(
+            h.problems,
+            vec!["last GC: TASK ERROR: EIO", "GC found 2 chunks still bad"]
+        );
     }
 
     #[tokio::test]
