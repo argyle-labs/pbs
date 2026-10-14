@@ -22,8 +22,7 @@ pub mod tools;
 pub const PROVIDER: &str = "pbs";
 
 use plugin_toolkit::service::{
-    BoxFuture, Mount, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError,
-    ServiceStatus, WorkloadSpec,
+    BoxFuture, Mount, Routes, Runtime, ServiceBackend, ServiceError, ServiceStatus, WorkloadSpec,
 };
 
 /// Image published from `docker/Dockerfile` in this repo. Upstream ships PBS for
@@ -159,16 +158,6 @@ impl ServiceBackend for PbsBackend {
     /// drives pct/docker itself (that mechanic lives in the deploy-target domain).
     fn runtimes(&self) -> Vec<Runtime> {
         vec![Runtime::Docker, Runtime::Podman, Runtime::Lxc, Runtime::Vm]
-    }
-
-    fn capabilities(&self) -> Vec<ServiceCapability> {
-        vec![
-            ServiceCapability::Deploy,
-            ServiceCapability::Backup,
-            ServiceCapability::Restore,
-            ServiceCapability::Configure,
-            ServiceCapability::Status,
-        ]
     }
 
     fn default_port(&self) -> u16 {
