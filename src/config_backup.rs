@@ -2955,7 +2955,7 @@ mod tests {
         assert!(i.missing_required.is_empty());
         assert_eq!(
             i.apply_schedule,
-            r#"orca config upsert schedule pbs-config-backup-pbs '{"job":"backup.run","cron":"10 3 * * *","args":{"kind":"pbs-config","instance":"pbs","execute":true}}' --execute"#
+            r#"orca config upsert schedule pbs-config-backup-pbs '{"args":{"execute":true,"instance":"pbs","kind":"pbs-config"},"cron":"10 3 * * *","job":"backup.run"}' --execute"#
         );
     }
 
