@@ -25,7 +25,7 @@ pub struct PbsEndpoint {
 const SECRET_FIELD: &str = "token_secret";
 const FINGERPRINT_FIELD: &str = "fingerprint";
 
-pub(crate) fn secret_name(endpoint: &str, field: &str) -> String {
+pub(crate) fn secret_name(endpoint: &str, field: &str) -> Result<secrets::SecretRef> {
     secrets::scoped_name(PROVIDER, endpoint, field)
 }
 
@@ -53,15 +53,15 @@ fn entry(row: &EndpointRow) -> EndpointEntry {
 }
 
 fn fingerprint(endpoint: &str) -> Result<Option<Fingerprint>> {
-    secrets::get(&secret_name(endpoint, FINGERPRINT_FIELD))?
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| Fingerprint::parse(&s))
+    secrets::get(secret_name(endpoint, FINGERPRINT_FIELD)?.as_str())?
+        .filter(|s| !s.expose_secret().trim().is_empty())
+        .map(|s| Fingerprint::parse(s.expose_secret()))
         .transpose()
 }
 
 fn token(row: &EndpointRow) -> Result<ApiToken> {
-    let secret = secrets::get(&secret_name(&row.name, SECRET_FIELD))?
-        .filter(|s| !s.is_empty())
+    let secret = secrets::get(secret_name(&row.name, SECRET_FIELD)?.as_str())?
+        .filter(|s| !s.expose_secret().is_empty())
         .ok_or_else(|| {
             anyhow!(
                 "no token secret stored for pbs endpoint '{}'; set one with \
@@ -70,7 +70,7 @@ fn token(row: &EndpointRow) -> Result<ApiToken> {
                 row.name
             )
         })?;
-    ApiToken::new(&row.token_id, secret)
+    ApiToken::new(&row.token_id, secret.expose_secret().as_str())
 }
 
 /// Pick the named endpoint, or the only one registered.
@@ -152,12 +152,12 @@ pub struct PbsCreateOutput {
 /// secret is deleted after the copy, so any other name could make this verb
 /// read or destroy a secret that belongs to something else. The rejected
 /// reference is not echoed, since a caller may have pasted the value itself.
-fn resolve_ref(reference: &str, endpoint: &str) -> Result<String> {
+fn resolve_ref(reference: &str, endpoint: &str) -> Result<secrets::Secret<String>> {
     if reference != format!("pbs.{endpoint}.staged") {
         bail!("token_secret_ref must be the orca secret pbs.{endpoint}.staged");
     }
     secrets::get(reference)?
-        .filter(|v| !v.trim().is_empty())
+        .filter(|v| !v.expose_secret().trim().is_empty())
         .ok_or_else(|| {
             anyhow!(
                 "no orca secret named '{reference}'; write it first with \
@@ -177,14 +177,14 @@ fn drop_staged(reference: &str) {
 fn store_secrets(name: &str, token_secret: Option<&str>, fp: Option<&Fingerprint>) -> Result<()> {
     if let Some(s) = token_secret {
         secrets::set(
-            &secret_name(name, SECRET_FIELD),
+            secret_name(name, SECRET_FIELD)?.as_str(),
             s,
             Some(&format!("PBS API token secret for endpoint '{name}'")),
         )?;
     }
     if let Some(fp) = fp {
         secrets::set(
-            &secret_name(name, FINGERPRINT_FIELD),
+            secret_name(name, FINGERPRINT_FIELD)?.as_str(),
             &fp.to_string(),
             Some(&format!(
                 "PBS TLS certificate pin for endpoint '{name}' (not sensitive)"
@@ -214,7 +214,7 @@ async fn pbs_create(args: PbsCreateArgs, _ctx: &ToolCtx) -> Result<PbsCreateOutp
         enabled: true,
     };
     endpoint_db::insert(&row).map_err(|e| runtime::map_insert_conflict(e, PROVIDER, &row.name))?;
-    if let Err(e) = store_secrets(&row.name, Some(&token_secret), fp.as_ref()) {
+    if let Err(e) = store_secrets(&row.name, Some(token_secret.expose_secret()), fp.as_ref()) {
         if let Err(rollback) = endpoint_db::remove(&row.name) {
             tracing::warn!(endpoint = %row.name, error = %rollback, "rollback of endpoint row failed");
         }
@@ -322,7 +322,7 @@ async fn pbs_update(args: PbsUpdateArgs, _ctx: &ToolCtx) -> Result<PbsUpdateOutp
     // gone, so the fix is forward: re-run the same update, which works because
     // the staged copy is only deleted on success.
     if let Some(s) = &token_secret {
-        store_secrets(&row.name, Some(s), None)?;
+        store_secrets(&row.name, Some(s.expose_secret()), None)?;
         applied.push("token_secret".to_string());
     }
     if !row_fields.is_empty() {
@@ -340,7 +340,9 @@ async fn pbs_update(args: PbsUpdateArgs, _ctx: &ToolCtx) -> Result<PbsUpdateOutp
     if let Some(fp) = &fp_change {
         let res = match fp {
             Some(fp) => store_secrets(&row.name, None, Some(fp)),
-            None => secrets::delete(&secret_name(&row.name, FINGERPRINT_FIELD)).map(|_| ()),
+            None => {
+                secrets::delete(secret_name(&row.name, FINGERPRINT_FIELD)?.as_str()).map(|_| ())
+            }
         };
         res.map_err(|e| fail(&applied, e))?;
         applied.push("fingerprint".to_string());
@@ -377,7 +379,7 @@ async fn pbs_delete(args: PbsDeleteArgs, _ctx: &ToolCtx) -> Result<PbsDeleteOutp
     let changed = endpoint_db::remove(&args.name)?;
     let mut secrets_removed = Vec::new();
     for field in [SECRET_FIELD, FINGERPRINT_FIELD] {
-        if secrets::delete(&secret_name(&args.name, field))? {
+        if secrets::delete(secret_name(&args.name, field)?.as_str())? {
             secrets_removed.push(field.to_string());
         }
     }
