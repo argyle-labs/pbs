@@ -121,7 +121,7 @@ pub fn validate_datastore(store: &str) -> Result<()> {
 }
 
 /// Name of the orca secret holding a host's token secret.
-pub fn secret_name(endpoint: &str, host: &str) -> String {
+pub fn secret_name(endpoint: &str, host: &str) -> Result<secrets::SecretRef> {
     endpoint::secret_name(endpoint, &format!("host_{host}_token"))
 }
 
@@ -484,11 +484,15 @@ pub fn diff_revoke(
     Ok((steps, notes))
 }
 
-async fn check_secret(c: &PbsClient, tokenid: &str, stored: Option<String>) -> SecretState {
+async fn check_secret(
+    c: &PbsClient,
+    tokenid: &str,
+    stored: Option<secrets::Secret<String>>,
+) -> SecretState {
     let Some(secret) = stored else {
         return SecretState::Missing;
     };
-    let Ok(token) = ApiToken::new(tokenid, secret) else {
+    let Ok(token) = ApiToken::new(tokenid, secret.expose_secret().as_str()) else {
         return SecretState::Rejected;
     };
     match c.with_token(token).status_of("/version").await {
@@ -498,7 +502,11 @@ async fn check_secret(c: &PbsClient, tokenid: &str, stored: Option<String>) -> S
     }
 }
 
-async fn read_state(c: &PbsClient, id: &Identity, stored: Option<String>) -> Result<State> {
+async fn read_state(
+    c: &PbsClient,
+    id: &Identity,
+    stored: Option<secrets::Secret<String>>,
+) -> Result<State> {
     let (acls, acl_digest) = api::acls_with_digest(c).await?;
     let users = api::users(c).await?;
     let now = plugin_toolkit::time::now().unix_seconds();
@@ -605,8 +613,8 @@ async fn enroll(
 ) -> Result<HostEnrollOutput> {
     const TOOL: &str = "pbs.host.enroll";
     id.check_not_self(c)?;
-    let sname = secret_name(ep, &id.host);
-    let stored = secrets::get(&sname)?.filter(|s| !s.is_empty());
+    let sname = secret_name(ep, &id.host)?;
+    let stored = secrets::get(sname.as_str())?.filter(|s| !s.expose_secret().is_empty());
     let held = stored.is_some();
     let st = read_state(c, id, stored).await?;
     let (findings, steps) = diff_enroll(id, &st, args.adopt)?;
@@ -620,7 +628,7 @@ async fn enroll(
         acl_path: id.acl_path.clone(),
         findings,
         change: Change::Plan(plan::plan(TOOL, args, summary.clone(), &steps, &[])?),
-        secret_ref: held.then(|| sname.clone()),
+        secret_ref: held.then(|| sname.to_string()),
     };
     if !args.execute {
         return Ok(out);
@@ -636,7 +644,7 @@ async fn enroll(
         }
         let secret = minted_secret(reply)
             .ok_or_else(|| anyhow!("PBS returned no secret for {}", id.tokenid))?;
-        secrets::set(&sname, secret, Some(&desc)).map_err(|e| {
+        secrets::set(sname.as_str(), secret, Some(&desc)).map_err(|e| {
             anyhow!(
                 "token secret for {} was minted but not stored ({e:#}); fix the secret backend \
                  and re-run, which regenerates it",
@@ -648,7 +656,7 @@ async fn enroll(
     })
     .await?;
     if stored_now {
-        out.secret_ref = Some(sname);
+        out.secret_ref = Some(sname.to_string());
     }
     out.change = Change::Applied(plan::applied(TOOL, summary, &steps, &results, notes));
     Ok(out)
@@ -742,10 +750,10 @@ async fn revoke(
         .iter()
         .any(|u| u.tokens.iter().any(|t| t.tokenid == id.tokenid));
     let (steps, mut notes) = diff_revoke(id, &st, args.delete_data, args.adopt)?;
-    let sname = secret_name(ep, &id.host);
+    let sname = secret_name(ep, &id.host)?;
     let summary = format!("revoke {} on {}", id.host, id.datastore);
     if !args.execute {
-        if secrets::exists(&sname)? {
+        if secrets::exists(sname.as_str())? {
             notes.push(format!(
                 "orca secret {sname} is removed once the token is gone"
             ));
@@ -763,7 +771,7 @@ async fn revoke(
     notes.extend(dropped);
     let results = plan::run(TOOL, c, &steps).await?;
     let token_gone = !token_exists || steps.iter().any(|s| s.action == "delete-token");
-    let secret_removed = token_gone && secrets::delete(&sname)?;
+    let secret_removed = token_gone && secrets::delete(sname.as_str())?;
     Ok(HostRevokeOutput {
         host: id.host.clone(),
         change: Change::Applied(plan::applied(TOOL, summary, &steps, &results, notes)),
