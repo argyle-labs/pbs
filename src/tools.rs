@@ -5,6 +5,7 @@
 //! unless `execute` is set — see [`crate::plan`].
 
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::serde_json::Value;
 
 use crate::api::{
     self, Datastore, DatastoreStatus, GcStatus, LogLine, Namespace, Task, TaskFilter, TaskStatus,
@@ -136,7 +137,8 @@ pub struct DatastoreHealthOutput {
 
 /// Health of every datastore: whether its chunk store is reachable (a store
 /// whose backing mount vanished fails its status read), mount and maintenance
-/// state, free space, and the last GC result. Read-only.
+/// state, free space, the last GC result, and whether a scheduled verify job
+/// covers it and last passed. Read-only.
 #[orca_tool(domain = "pbs", verb = "datastore.health", role = "read")]
 pub async fn pbs_datastore_health(
     args: DatastoreHealthArgs,
@@ -148,18 +150,51 @@ pub async fn pbs_datastore_health(
 
 async fn datastore_health(c: &PbsClient, min_free_pct: u8) -> Result<DatastoreHealthOutput> {
     let mut datastores = Vec::new();
+    let verify = crate::jobs::raw_jobs(c, crate::jobs::Kind::Verify, None)
+        .await
+        .map_err(|e| format!("verify jobs unreadable: {e:#}"));
     for ds in api::datastores(c).await? {
         let status = api::datastore_status(c, &ds.store).await;
         let gc = match status {
             Ok(_) => Some(api::gc_status(c, &ds.store).await),
             Err(_) => None,
         };
-        datastores.push(assess_datastore(ds, status, gc, min_free_pct));
+        let mut h = assess_datastore(ds, status, gc, min_free_pct);
+        match &verify {
+            Ok(jobs) => h.problems.extend(verify_problems(&h.datastore, jobs)),
+            Err(e) => h.problems.push(e.clone()),
+        }
+        h.ok = h.problems.is_empty();
+        datastores.push(h);
     }
     Ok(DatastoreHealthOutput {
         ok: datastores.iter().all(|d| d.ok),
         datastores,
     })
+}
+
+fn verify_problems(store: &str, jobs: &[Value]) -> Vec<String> {
+    let str_of = |j: &Value, k: &str| j.get(k).and_then(Value::as_str).map(str::to_string);
+    let mine: Vec<&Value> = jobs
+        .iter()
+        .filter(|j| str_of(j, "store").as_deref() == Some(store))
+        .collect();
+    if mine.is_empty() {
+        return vec!["no verify job: corrupt chunks surface only at restore".to_string()];
+    }
+    let mut problems = Vec::new();
+    if !mine.iter().any(|j| str_of(j, "schedule").is_some()) {
+        problems.push("verify jobs exist but none is scheduled".to_string());
+    }
+    for j in &mine {
+        if let Some(state) = str_of(j, "last-run-state").filter(|s| s != "ok") {
+            problems.push(format!(
+                "verify job {} last run: {state}",
+                str_of(j, "id").unwrap_or_default()
+            ));
+        }
+    }
+    problems
 }
 
 fn assess_datastore(
@@ -667,6 +702,7 @@ mod tests {
             DATASTORE_STATUS,
         );
         m.on(Method::Get, "/admin/datastore/main/gc", 200, GC_STATUS);
+        m.on(Method::Get, "/admin/verify", 200, VERIFY_LIST);
         m.on(
             Method::Get,
             "/admin/datastore/archive/status",
@@ -684,7 +720,29 @@ mod tests {
             "{:?}",
             archive.problems
         );
+        assert!(archive
+            .problems
+            .iter()
+            .any(|p| p.starts_with("no verify job")));
         assert!(!m.log().iter().any(|l| l.contains("archive/gc")));
+    }
+
+    #[test]
+    fn verify_job_coverage_problems() {
+        let jobs = vec![
+            json!({"id": "a", "store": "main", "schedule": "sat 03:00", "last-run-state": "ok"}),
+            json!({"id": "b", "store": "main", "last-run-state": "TASK ERROR: 3 snapshots failed"}),
+            json!({"id": "c", "store": "cold"}),
+        ];
+        assert_eq!(
+            verify_problems("main", &jobs),
+            vec!["verify job b last run: TASK ERROR: 3 snapshots failed".to_string()]
+        );
+        assert_eq!(
+            verify_problems("cold", &jobs),
+            vec!["verify jobs exist but none is scheduled".to_string()]
+        );
+        assert!(verify_problems("none", &jobs)[0].starts_with("no verify job"));
     }
 
     fn ds(mount: Option<&str>, maintenance: Option<&str>) -> Datastore {

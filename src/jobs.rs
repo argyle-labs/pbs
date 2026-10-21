@@ -758,6 +758,48 @@ pub async fn pbs_verify_job_run(args: JobRunArgs, ctx: &ToolCtx) -> Result<Chang
     .await
 }
 
+pub fn ensure_steps(
+    kind: Kind,
+    existing: Option<&Value>,
+    id: &str,
+    fields: Map<String, Value>,
+    digest: Option<&str>,
+) -> Result<Vec<Step>> {
+    match existing {
+        None => create_steps(kind, None, id, fields),
+        Some(_) => update_steps(kind, existing, id, fields, &[], digest),
+    }
+}
+
+/// Create the verify job, or bring an existing one to the given fields; only
+/// differing fields are sent and an in-sync job is a no-op. Requires `store`.
+/// Dry-run by default.
+#[orca_tool(
+    domain = "pbs",
+    verb = "verify_job.ensure",
+    role = "admin",
+    execute_gated = false
+)]
+pub async fn pbs_verify_job_ensure(args: VerifyJobCreateArgs, ctx: &ToolCtx) -> Result<Change> {
+    crate::plan::require_admin("pbs.verify_job.ensure", ctx.caller().as_ref())?;
+    if args.fields.store.is_none() {
+        bail!("pbs.verify_job.ensure needs store");
+    }
+    let fields = args.fields.to_map();
+    mutate(
+        "pbs.verify_job.ensure",
+        Kind::Verify,
+        &args,
+        args.endpoint.as_deref(),
+        &args.id,
+        args.execute,
+        ctx,
+        true,
+        |e, d| ensure_steps(Kind::Verify, e, &args.id, fields, d),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -971,6 +1013,31 @@ mod tests {
                 .unwrap()
                 .clone()
         );
+    }
+
+    #[test]
+    fn ensure_creates_when_absent_and_diffs_when_present() {
+        let mut fields = Map::new();
+        fields.insert("store".into(), json!("main"));
+        fields.insert("schedule".into(), json!("sat 03:00"));
+        let created = ensure_steps(Kind::Verify, None, "v", fields.clone(), None).unwrap();
+        assert_eq!(created.len(), 1);
+        let job = data(VERIFY_LIST)[0].clone();
+        assert!(ensure_steps(
+            Kind::Verify,
+            Some(&job),
+            "v-main-weekly",
+            fields.clone(),
+            None
+        )
+        .unwrap()
+        .is_empty());
+        fields.insert("schedule".into(), json!("daily"));
+        let updated =
+            ensure_steps(Kind::Verify, Some(&job), "v-main-weekly", fields, Some("d")).unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(created[0].action, "create-job");
+        assert_eq!(updated[0].action, "update-job");
     }
 }
 
