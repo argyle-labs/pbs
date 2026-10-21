@@ -126,6 +126,8 @@ pub struct DatastoreHealth {
     pub gc_last_run_state: Option<String>,
     pub ok: bool,
     pub problems: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[orca_struct]
@@ -161,7 +163,11 @@ async fn datastore_health(c: &PbsClient, min_free_pct: u8) -> Result<DatastoreHe
         };
         let mut h = assess_datastore(ds, status, gc, min_free_pct);
         match &verify {
-            Ok(jobs) => h.problems.extend(verify_problems(&h.datastore, jobs)),
+            Ok(jobs) => {
+                let (problems, warnings) = verify_findings(&h.datastore, jobs);
+                h.problems.extend(problems);
+                h.warnings.extend(warnings);
+            }
             Err(e) => h.problems.push(e.clone()),
         }
         h.ok = h.problems.is_empty();
@@ -173,28 +179,59 @@ async fn datastore_health(c: &PbsClient, min_free_pct: u8) -> Result<DatastoreHe
     })
 }
 
-fn verify_problems(store: &str, jobs: &[Value]) -> Vec<String> {
+#[derive(Debug, PartialEq, Eq)]
+enum RunState {
+    Ok,
+    Warning,
+    Failure,
+}
+
+fn run_state(state: &str) -> RunState {
+    let state = state.trim();
+    if state.eq_ignore_ascii_case("ok") {
+        RunState::Ok
+    } else if state
+        .get(..9)
+        .is_some_and(|p| p.eq_ignore_ascii_case("warnings:"))
+    {
+        RunState::Warning
+    } else {
+        RunState::Failure
+    }
+}
+
+fn verify_findings(store: &str, jobs: &[Value]) -> (Vec<String>, Vec<String>) {
     let str_of = |j: &Value, k: &str| j.get(k).and_then(Value::as_str).map(str::to_string);
     let mine: Vec<&Value> = jobs
         .iter()
         .filter(|j| str_of(j, "store").as_deref() == Some(store))
         .collect();
     if mine.is_empty() {
-        return vec!["no verify job: corrupt chunks surface only at restore".to_string()];
+        return (
+            vec!["no verify job: corrupt chunks surface only at restore".to_string()],
+            Vec::new(),
+        );
     }
     let mut problems = Vec::new();
+    let mut warnings = Vec::new();
     if !mine.iter().any(|j| str_of(j, "schedule").is_some()) {
         problems.push("verify jobs exist but none is scheduled".to_string());
     }
     for j in &mine {
-        if let Some(state) = str_of(j, "last-run-state").filter(|s| s != "ok") {
-            problems.push(format!(
-                "verify job {} last run: {state}",
-                str_of(j, "id").unwrap_or_default()
-            ));
+        let Some(state) = str_of(j, "last-run-state") else {
+            continue;
+        };
+        let line = format!(
+            "verify job {} last run: {state}",
+            str_of(j, "id").unwrap_or_default()
+        );
+        match run_state(&state) {
+            RunState::Ok => {}
+            RunState::Warning => warnings.push(line),
+            RunState::Failure => problems.push(line),
         }
     }
-    problems
+    (problems, warnings)
 }
 
 fn assess_datastore(
@@ -204,6 +241,7 @@ fn assess_datastore(
     min_free_pct: u8,
 ) -> DatastoreHealth {
     let mut problems = Vec::new();
+    let mut warnings = Vec::new();
     if ds.mount_status.as_deref() == Some("notmounted") {
         problems.push("removable datastore is not mounted".to_string());
     }
@@ -231,8 +269,12 @@ fn assess_datastore(
     };
     let gc_last_run_state = match gc {
         Some(Ok(gc)) => {
-            if let Some(state) = gc.last_run_state.as_deref().filter(|s| *s != "ok") {
-                problems.push(format!("last GC: {state}"));
+            if let Some(state) = gc.last_run_state.as_deref() {
+                match run_state(state) {
+                    RunState::Ok => {}
+                    RunState::Warning => warnings.push(format!("last GC: {state}")),
+                    RunState::Failure => problems.push(format!("last GC: {state}")),
+                }
             }
             if gc.still_bad > 0 {
                 problems.push(format!("GC found {} chunks still bad", gc.still_bad));
@@ -254,6 +296,7 @@ fn assess_datastore(
         gc_last_run_state,
         ok: problems.is_empty(),
         problems,
+        warnings,
     }
 }
 
@@ -712,7 +755,7 @@ mod tests {
         let h = datastore_health(&m.client(), 10).await.unwrap();
         assert!(!h.ok);
         assert!(h.datastores[0].ok, "{:?}", h.datastores[0].problems);
-        assert_eq!(h.datastores[0].gc_last_run_state.as_deref(), Some("ok"));
+        assert_eq!(h.datastores[0].gc_last_run_state.as_deref(), Some("OK"));
         let archive = &h.datastores[1];
         assert!(!archive.ok);
         assert!(
@@ -730,19 +773,33 @@ mod tests {
     #[test]
     fn verify_job_coverage_problems() {
         let jobs = vec![
-            json!({"id": "a", "store": "main", "schedule": "sat 03:00", "last-run-state": "ok"}),
+            json!({"id": "a", "store": "main", "schedule": "sat 03:00", "last-run-state": "OK"}),
             json!({"id": "b", "store": "main", "last-run-state": "TASK ERROR: 3 snapshots failed"}),
+            json!({"id": "w", "store": "main", "last-run-state": "WARNINGS: 2"}),
             json!({"id": "c", "store": "cold"}),
         ];
         assert_eq!(
-            verify_problems("main", &jobs),
-            vec!["verify job b last run: TASK ERROR: 3 snapshots failed".to_string()]
+            verify_findings("main", &jobs),
+            (
+                vec!["verify job b last run: TASK ERROR: 3 snapshots failed".to_string()],
+                vec!["verify job w last run: WARNINGS: 2".to_string()]
+            )
         );
         assert_eq!(
-            verify_problems("cold", &jobs),
+            verify_findings("cold", &jobs).0,
             vec!["verify jobs exist but none is scheduled".to_string()]
         );
-        assert!(verify_problems("none", &jobs)[0].starts_with("no verify job"));
+        assert!(verify_findings("none", &jobs).0[0].starts_with("no verify job"));
+    }
+
+    #[test]
+    fn run_state_classifies_case_insensitively() {
+        assert_eq!(run_state("OK"), RunState::Ok);
+        assert_eq!(run_state("ok"), RunState::Ok);
+        assert_eq!(run_state("WARNINGS: 3"), RunState::Warning);
+        assert_eq!(run_state("warnings: 1"), RunState::Warning);
+        assert_eq!(run_state("TASK ERROR: EIO"), RunState::Failure);
+        assert_eq!(run_state("unknown"), RunState::Failure);
     }
 
     fn ds(mount: Option<&str>, maintenance: Option<&str>) -> Datastore {
@@ -788,6 +845,13 @@ mod tests {
             h.problems,
             vec!["last GC: TASK ERROR: EIO", "GC found 2 chunks still bad"]
         );
+        let gc = GcStatus {
+            last_run_state: Some("WARNINGS: 1".into()),
+            ..GcStatus::default()
+        };
+        let h = assess_datastore(ds(None, None), st(1000, 500), Some(Ok(gc)), 10);
+        assert!(h.ok);
+        assert_eq!(h.warnings, vec!["last GC: WARNINGS: 1"]);
     }
 
     #[tokio::test]
