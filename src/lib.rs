@@ -195,9 +195,9 @@ impl ServiceBackend for PbsBackend {
                     mounts: vec![
                         // Config + server identity. Named volume rather than a
                         // host path so recreating the container is lossless.
-                        Mount::bind(config_volume(instance), CONFIG_DIR),
-                        Mount::bind(lib_volume(instance), LIB_DIR),
-                        Mount::bind(logs_volume(instance), LOG_DIR),
+                        Mount::volume(config_volume(instance), CONFIG_DIR),
+                        Mount::volume(lib_volume(instance), LIB_DIR),
+                        Mount::volume(logs_volume(instance), LOG_DIR),
                         // PBS keeps its config-version cache in shared memory
                         // here and requires tmpfs; on a plain directory the
                         // server still serves but traffic control never loads.
